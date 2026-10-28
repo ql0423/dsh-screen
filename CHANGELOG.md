@@ -1,5 +1,15 @@
 # 更新记录
 
+## 0.5.1 — 2026-10-29
+
+现场演示时抓到的真 bug，值得单独发一版。
+
+- **`screen_act action:"open"` 打不开网址。** 原来用 `spawn(app, { shell: true })`，等于让 `cmd.exe` 去执行 `https://www.douyin.com`——cmd 把它当**命令名**，报「不是内部或外部命令」然后退出；工具却照样回一句「启动了 …（pid xxx）」，因为挣到的是一个马上死掉的 cmd 进程。改成 `ShellExecuteW`（user32/shell32 的正路）：URL 作为**文档**交给系统关联，文档交给它自己的程序打开。
+- `app` 现在支持「程序 + 参数」（`msedge.exe https://…`），带空格的完整路径不会被拆错（`C:\Program Files\…` 照样当一条路径）。
+- 打开结果按 `ShellExecuteW` 的返回值判定（> 32 才算成功），失败会明说返回码，不再假报成功。
+
+实测：`open https://example.com` → Edge 打开 Example Domain；`open notepad.exe` → 记事本起来。
+
 ## 0.5.0 — 2026-10-29
 
 主人用了一晚之后提的问题：**"我不能确定鼠标和键盘是不是被托管着"**——插件动手时前台往往被切到别的窗口，DSH 里的进度看不见，人分不清它是还在干、还是早干完了。这一版补的就是"告知"。

@@ -1,10 +1,12 @@
 // Win32 bindings through koffi: screen capture, window enumeration, SendInput.
 // Everything is in PHYSICAL pixels; the host process sets no DPI virtualization for us.
 import koffi from 'koffi'
+import { existsSync } from 'node:fs'
 
 const user32 = koffi.load('user32.dll')
 const gdi32 = koffi.load('gdi32.dll')
 const kernel32 = koffi.load('kernel32.dll')
+const shell32 = koffi.load('shell32.dll')
 
 const f = (lib, sig) => lib.func(sig)
 
@@ -54,6 +56,7 @@ const SetWindowPos = f(user32, 'int __stdcall SetWindowPos(void *hWnd, void *hWn
 const OpenProcess = f(kernel32, 'void * __stdcall OpenProcess(uint32 dwDesiredAccess, int bInheritHandle, uint32 dwProcessId)')
 const QueryFullProcessImageNameW = f(kernel32, 'int __stdcall QueryFullProcessImageNameW(void *hProcess, uint32 dwFlags, void *lpExeName, void *lpdwSize)')
 const CloseHandle = f(kernel32, 'int __stdcall CloseHandle(void *hObject)')
+const ShellExecuteW = f(shell32, 'intptr __stdcall ShellExecuteW(void *hwnd, str16 lpOperation, str16 lpFile, str16 lpParameters, str16 lpDirectory, int nShowCmd)')
 
 // SendInput(INPUT) layout on x64: 4 type + 4 pad + 32 union = 40 bytes.
 const INPUT_SIZE = process.arch === 'x64' ? 40 : 28
@@ -613,6 +616,50 @@ export function closeWindow(hwndRaw) {
   ensureDpi()
   const WM_CLOSE = 0x0010
   return Boolean(PostMessageW(hwndRaw, WM_CLOSE, 0, 0))
+}
+
+/**
+ * Launch something the way double-clicking it would: ShellExecuteW honours the shell's
+ * associations, so a URL reaches the default browser and a document reaches its app.
+ *
+ * This replaced `spawn(cmd, { shell: true })`, which was wrong in a way that only shows
+ * up for URLs: cmd.exe treats "https://…" as a *command name*, fails, and exits — the
+ * call reported a pid while nothing was ever opened. ShellExecuteW takes the URL as a
+ * document, which is what a user means by "open this".
+ *
+ * Returns { ok, code } where code is the HINSTANCE-style result (<= 32 means failure).
+ */
+export function shellOpen(file, params = null) {
+  ensureDpi()
+  try {
+    const rc = Number(ShellExecuteW(null, 'open', file, params, null, 1))
+    return { ok: rc > 32, code: rc }
+  } catch (error) {
+    return { ok: false, code: 0, error: error?.message ?? String(error) }
+  }
+}
+
+/**
+ * Split an app spec into (file, parameters): "notepad.exe" → itself, "msedge.exe https://x"
+ * → the exe plus its argument, and a quoted or existing path with spaces stays one file.
+ */
+export function splitAppSpec(spec) {
+  const raw = String(spec ?? '').trim()
+  if (!raw) return null
+  const quoted = raw.match(/^"(.+?)"\s*(.*)$/)
+  if (quoted) return { file: quoted[1], params: quoted[2] || null }
+  if (/^[a-z]+:\/\//i.test(raw)) return { file: raw, params: null }
+  const space = raw.indexOf(' ')
+  if (space > 0) {
+    const head = raw.slice(0, space)
+    const rest = raw.slice(space + 1).trim()
+    // "C:\Program Files\App\app.exe" — a real path with a space must not be split.
+    try {
+      if (!existsSync(head) && existsSync(raw)) return { file: raw, params: null }
+    } catch { /* a URL-ish or odd string: split it */ }
+    return { file: head, params: rest || null }
+  }
+  return { file: raw, params: null }
 }
 
 export const constants = { MOUSEEVENTF, KEYEVENTF, VK, SM, INPUT_SIZE }

@@ -4,7 +4,7 @@ import { defineTool } from './runtime.js'
 import {
   listWindows, foregroundWindow, focusWindow, windowHandleByTitle, closeWindow,
   click, drag, scroll, tryMoveCursor, cursorPosition, typeText, pressKey, hotkey,
-  processNameOfPid, screenMetrics, isKeyDown,
+  processNameOfPid, screenMetrics, isKeyDown, shellOpen, splitAppSpec,
 } from './win32.js'
 import { grab, describeDesktop, settle } from './capture.js'
 import { uia } from './uia.js'
@@ -301,9 +301,14 @@ function performAction(action, args, config, { point, target }) {
     }
     case 'open': {
       if (!args.app) throw new Error('open 需要 app')
-      const child = spawn(args.app, [], { detached: true, stdio: 'ignore', windowsHide: false, shell: true })
-      child.unref()
-      notes.push(`启动了 ${args.app}（pid ${child.pid}）`)
+      // ShellExecute, not cmd: a URL must reach the default browser instead of being run
+      // as a shell command (which silently fails and still reports a pid).
+      const spec = splitAppSpec(args.app)
+      if (!spec) throw new Error('open 需要 app')
+      const launched = shellOpen(spec.file, spec.params)
+      notes.push(launched.ok
+        ? `打开了 ${spec.file}${spec.params ? ` ${spec.params}` : ''}（由系统默认程序处理）`
+        : `打开失败：${spec.file}（ShellExecute 返回 ${launched.code}${launched.error ? `，${launched.error}` : ''}）`)
       break
     }
     case 'close': {
