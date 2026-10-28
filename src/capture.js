@@ -1,11 +1,21 @@
 // Screenshot pipeline: Win32 pixels -> downscaled RGB -> PNG on disk, plus a JSON-friendly summary.
 import { mkdirSync, writeFileSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { captureRect, captureWindow, bgraToRgb, screenMetrics, foregroundWindow, handleFromNumber, rectOfWindow, listWindows, cursorPosition, processNameOfPid } from './win32.js'
 import { encodePng, downscale } from './png.js'
 
 let shotDirCache = null
+
+/** The last frame handed out, so a byte-identical one is not stored twice. */
+let lastFrame = { key: null, hash: null, path: null, bytes: 0 }
+
+/** Wait without burning a CPU core; used for the settle before a post-action frame. */
+export function settle(ms) {
+  const span = Math.max(0, Math.round(ms))
+  if (span > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, span)
+}
 
 export function shotDir(configured) {
   if (shotDirCache) return shotDirCache
@@ -23,11 +33,17 @@ function stamp() {
 
 /**
  * Grab the desktop, one window, or a rectangle and write a PNG.
+ *
+ * `dedupe` (default on) skips encoding and writing when the pixels are identical to the
+ * frame handed out last time — the model's earlier view, and the coordinates taken from
+ * it, still describe this screen. `forceImage` overrides that.
+ *
  * @param {{dir?:string, window?:number|string, region?:{x:number,y:number,width:number,height:number},
- *          maxWidth?:number, maxHeight?:number, name?:string}} options
+ *          maxWidth?:number, maxHeight?:number, name?:string, dedupe?:boolean, forceImage?:boolean}} options
  */
 export function grab(options = {}) {
   const { window: windowRef, region, maxWidth = 1600, maxHeight = 1200, name } = options
+  const dedupe = options.dedupe !== false
   let source
   let origin
   let label
@@ -57,17 +73,40 @@ export function grab(options = {}) {
 
   const rgb = bgraToRgb(source)
   const scaled = downscale(rgb, maxWidth, maxHeight)
+  const scaleX = source.width / scaled.width
+  const scaleY = source.height / scaled.height
+
+  const hash = createHash('sha1').update(scaled.data).digest('hex')
+  const key = `${label}|${maxWidth}x${maxHeight}|${source.width}x${source.height}`
+  if (dedupe && !options.forceImage && lastFrame.key === key && lastFrame.hash === hash) {
+    try {
+      return {
+        path: lastFrame.path,
+        bytes: statSync(lastFrame.path).size,
+        imageWidth: scaled.width,
+        imageHeight: scaled.height,
+        sourceWidth: source.width,
+        sourceHeight: source.height,
+        origin,
+        scaleX,
+        scaleY,
+        label,
+        hash,
+        unchanged: true,
+      }
+    } catch { /* the old file was pruned; fall through and write a new one */ }
+  }
+
   const png = encodePng(scaled)
   const dir = shotDir(options.dir)
   const file = join(dir, `${name || 'screen'}-${stamp()}.png`)
   writeFileSync(file, png)
-
-  const scaleX = source.width / scaled.width
-  const scaleY = source.height / scaled.height
+  const bytes = statSync(file).size
+  lastFrame = { key, hash, path: file, bytes }
 
   return {
     path: file,
-    bytes: statSync(file).size,
+    bytes,
     imageWidth: scaled.width,
     imageHeight: scaled.height,
     sourceWidth: source.width,
@@ -77,6 +116,8 @@ export function grab(options = {}) {
     scaleX,
     scaleY,
     label,
+    hash,
+    unchanged: false,
   }
 }
 

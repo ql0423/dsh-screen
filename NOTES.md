@@ -22,7 +22,7 @@
 | --- | --- |
 | koffi 直接调 Win32，不用现成的自动化库 | 截屏、窗口、输入这几件事，Win32 一层就够；少一层依赖，少一层版本冲突 |
 | 零依赖 PNG 编码器 | 不引 sharp/canvas 这类重家伙；顺便把盒式降采样做进去，省视觉 token |
-| UIA 走一次性 PowerShell 桥 | `System.Windows.Automation` 在 .NET Framework 里现成可用，不必为了 UIA 引 Node 原生模块；JSON 进 JSON 出，进程用完就退 |
+| UIA 走 PowerShell 桥（0.3.0 起常驻） | `System.Windows.Automation` 在 .NET Framework 里现成可用，不必为了 UIA 引 Node 原生模块；JSON 进 JSON 出。0.2.x 是「用一次起一个进程」，慢；0.3.0 改成一个常驻 worker 收行式请求，闲置 5 分钟自己退 |
 | 坐标一律物理像素 | 高 DPI 下「逻辑像素」是踩坑重灾区；插件自己声明 per-monitor DPI 感知，换算交给它 |
 | 手工输入走 `KEYEVENTF_UNICODE` | 中文直接进，不依赖输入法；模拟键盘敲字会被输入法吞掉 |
 | 动作后自动补一张截图 | 智能体能自己确认这一步有没有生效，不用用户盯着 |
@@ -55,6 +55,32 @@
 
 - Navicat 自己的消息面板：已处理 2、成功 2、错误 0，`CREATE TABLE` 0.037s，`INSERT` 影响 3 行；
 - 用 sqlite3 只读打开库文件：`rows = [(1,'米饭'),(2,'蓝色大肥鱼'),(3,'2026-10-28 验收')]`。
+
+## 速度：跟 dsh-pilot 对比之后改的（0.3.0）
+
+2026-10-28 把 [dsh-pilot](https://github.com/momasiku/dsh-pilot)（MIT，作者 momasiku）的源码逐行读了一遍，也在本机把每一环量了一遍。结论和直觉相反：
+
+| 环节 | 本插件 0.2.2 | dsh-pilot | 结论 |
+| --- | --- | --- | --- |
+| 点击注入 | 0.4 ms（koffi → SendInput） | ≈125 ms（`SetCursorPos` + 等 80 ms + 验焦点 + down + 等 45 ms + up） | 我们的核心本来就快，抄它的点击只会变慢 |
+| 动作后截图 | ~100 ms | 同量级，另外默认还等 750 ms | 相当 |
+| 读 UIA | ~440 ms（每次新起 PowerShell） | ~130–300 ms（常驻 worker + 缓存编译的 DLL） | **它快，差在这里** |
+| 多步任务 | N 步 = N 次调用 | N 步 = 1 次调用（`desktop_sequence`） | **它快，差在这里** |
+
+所以这一版只学两件：**批处理**和**常驻 worker**。它的流程里也有值得借的：整批先验风险再动手、按控件矩形中心点、`delivered_scale` 约定（我们有等价做法——自己降采样，所以折算比例本身就是已知的）。
+
+改完本机实测（2560×1600，Windows PowerShell 5.1）：
+
+- `screen_look` 129 ms（整屏 → 1280×900 PNG + 窗口清单）
+- 读 UIA 控件树：440 ms → **31–38 ms**（第一次仍要付 ~400 ms 启动费）
+- `screen_sequence` 10 步 move：1 ms，一次调用
+- 静止画面第二次截图：**0 ms**（复用上一张，`unchanged: true`）
+
+三个实现时踩到的坑，留给以后：
+
+1. **常驻 worker 的对象不能在返回时展开**。为了挂 `readyPromise` 写成 `return { ...w, readyPromise }`，结果 stdout 处理器改的是原件、调用方等的是副本，每次请求都熬满超时（60 s）才回退。字段必须挂在同一个对象上。
+2. **痛点不在毫秒**。模型一次往返是秒级的，插件的 400 ms 相对它不算大；但 5 次往返就是 5 次模型决策。批处理省的是这个。
+3. **`settleMs` 是正确性问题，不只是速度问题**。动作和截图在同一个 tick 里，可能拍到重绘前的画面，智能体就会判断「没生效」再点一次——一次白往返，还可能点出双击。
 
 ## 隐私
 

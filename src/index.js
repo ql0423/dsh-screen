@@ -10,6 +10,7 @@ import { z, hasHostRuntime } from './runtime.js'
 import { createTools } from './tools.js'
 import { screenMetrics } from './win32.js'
 import { shotDir } from './capture.js'
+import { stopUiaWorker } from './uia.js'
 
 export const name = 'dsh-screen'
 
@@ -24,6 +25,8 @@ const DEFAULTS = {
   observeMaxHeight: 900,
   typeDelayMs: 0,
   requireFreshLookSeconds: 120,
+  settleMs: 180,
+  maxSequenceSteps: 24,
 }
 
 export const Config = hasHostRuntime
@@ -35,6 +38,8 @@ export const Config = hasHostRuntime
     observeMaxHeight: z.number().default(900).description('动作后自动截图的最大高度'),
     typeDelayMs: z.number().default(0).description('逐字输入时每个字符之间的间隔毫秒数'),
     requireFreshLookSeconds: z.number().default(120).description('动手前多久内必须看过屏幕，0 = 不检查'),
+    settleMs: z.number().default(180).description('动作后等画面重绘多久再截图，默认 180 毫秒'),
+    maxSequenceSteps: z.number().default(24).description('screen_sequence 一批最多几步'),
   })
   : undefined
 
@@ -72,6 +77,8 @@ export function apply(ctx, config) {
       try { dispose() } catch { /* already gone with the plugin scope */ }
     }
     disposers.length = 0
+    // Leave no stray PowerShell behind when the plugin goes away.
+    try { stopUiaWorker() } catch { /* nothing warm to stop */ }
   }
   try { ctx.on('dispose', cleanup) } catch { /* older host without a dispose event */ }
   return cleanup
