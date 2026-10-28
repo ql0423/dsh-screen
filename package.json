@@ -1,6 +1,6 @@
 {
   "name": "dsh-screen",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Desktop eyes and hands for DeepSeek Harness: screenshot, window control, UI Automation tree and SendInput mouse/keyboard, all driven from inside DSH — no floating ball, no extra window",
   "type": "module",
   "main": "src/index.js",
@@ -37,8 +37,12 @@
     "@deepseek-ai/schemastery": "~3.18.5"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-tools": { "optional": true },
-    "@deepseek-ai/schemastery": { "optional": true }
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
   },
   "dependencies": {
     "koffi": "^3.3.4"

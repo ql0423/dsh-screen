@@ -27,6 +27,7 @@ const DEFAULTS = {
   requireFreshLookSeconds: 120,
   settleMs: 180,
   maxSequenceSteps: 24,
+  uiaMinControls: 3,
 }
 
 export const Config = hasHostRuntime
@@ -40,6 +41,7 @@ export const Config = hasHostRuntime
     requireFreshLookSeconds: z.number().default(120).description('动手前多久内必须看过屏幕，0 = 不检查'),
     settleMs: z.number().default(180).description('动作后等画面重绘多久再截图，默认 180 毫秒'),
     maxSequenceSteps: z.number().default(24).description('screen_sequence 一批最多几步'),
+    uiaMinControls: z.number().default(3).description('screen_look 的 auto 模式里，UIA 至少给出几个可操作控件才不截图'),
   })
   : undefined
 

@@ -12,8 +12,155 @@ import { gate } from './safety.js'
 
 const text = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
 
-/** Only one screenshot is "current" at a time; actions may reference its pixel space. */
-const state = { lastShot: null }
+/**
+ * Only one screenshot is "current" at a time; actions may reference its pixel space.
+ * `lastLookAt` is about freshness of *knowledge*: a UI Automation read counts as a look
+ * even though it produced no image at all.
+ */
+const state = { lastShot: null, lastLookAt: 0 }
+
+/** Control types that can be operated even when they advertise no UIA pattern. */
+const OPERABLE_TYPES = new Set([
+  'Button', 'Edit', 'ComboBox', 'ListItem', 'MenuItem', 'TabItem', 'CheckBox',
+  'RadioButton', 'Slider', 'Hyperlink', 'SplitButton', 'TreeItem', 'DataItem',
+  'Document', 'Spinner',
+])
+
+/** Which UIA pattern decides how this control should be driven, best first. */
+function actionFor(node) {
+  const patterns = Array.isArray(node.patterns) ? node.patterns : []
+  const has = name => patterns.includes(name)
+  if (has('invoke')) return 'invoke'
+  if (has('value')) return 'fill'
+  if (has('toggle')) return 'toggle'
+  if (has('selectionitem')) return 'select'
+  if (has('expandcollapse')) return 'expand'
+  if (has('scroll')) return 'scroll'
+  if (OPERABLE_TYPES.has(node.type)) return 'click'
+  return null
+}
+
+function centerOf(rect) {
+  if (!rect || !rect.width || !rect.height) return null
+  return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }
+}
+
+function metaNote(meta) {
+  if (!meta || typeof meta !== 'object') return ''
+  const parts = []
+  if (meta.toggle) parts.push(`toggle:${meta.toggle}`)
+  if (meta.expand) parts.push(`state:${meta.expand}`)
+  if (meta.password) parts.push('password')
+  else if (meta.value !== undefined && meta.value !== '') parts.push(`value:${JSON.stringify(meta.value).slice(0, 40)}`)
+  if (meta.readonly) parts.push('readonly')
+  if (meta.min !== undefined && meta.max !== undefined) parts.push(`range:${meta.min}-${meta.max}`)
+  return parts.length ? `  [${parts.join('] [')}]` : ''
+}
+
+/**
+ * Read a window's controls through UI Automation and shape them for the model: one line
+ * per operable control with its centre, its path (for `control:`), and how to drive it.
+ */
+async function uiaView(target, { maxDepth = 4, maxNodes = 160 } = {}) {
+  const response = await uia({
+    action: 'tree',
+    ...(target?.handle ? { handle: target.handle } : {}),
+    maxDepth,
+    maxNodes,
+    meta: true,
+  }, { timeoutMs: 25000 })
+  if (!response.ok) throw new Error(`UIA 读取失败：${response.error ?? '未知原因'}`)
+  const bounds = desktopBounds()
+  const nodes = (response.nodes ?? []).map(node => ({
+    ...node,
+    action: actionFor(node),
+    center: centerOf(node.rect),
+  }))
+  const controls = nodes.filter(node => {
+    if (!node.action || !node.center || node.offscreen) return false
+    // A control can claim to be visible and still sit outside every monitor (scrolled-out
+    // rows do this). Clicking there would send the mouse into nowhere.
+    if (!bounds) return true
+    const { x, y } = node.center
+    return x >= bounds.x1 - 1 && y >= bounds.y1 - 1 && x <= bounds.x2 + 1 && y <= bounds.y2 + 1
+  })
+  return { nodes, controls, truncated: Boolean(response.truncated) }
+}
+
+/** Union of every visible window's rectangle — the area a click can actually land in. */
+function desktopBounds() {
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity
+  for (const w of listWindows()) {
+    if (!w.rect) continue
+    x1 = Math.min(x1, w.rect.x)
+    y1 = Math.min(y1, w.rect.y)
+    x2 = Math.max(x2, w.rect.x + w.rect.width)
+    y2 = Math.max(y2, w.rect.y + w.rect.height)
+  }
+  return Number.isFinite(x1) ? { x1, y1, x2, y2 } : null
+}
+
+/** The model-facing list of controls. */
+function controlLines(view, { title, limit = 120 } = {}) {
+  if (!view.controls.length) {
+    return `窗口「${title}」里 UIA 没给出可操作的控件（只有 ${view.nodes.length} 个节点）。`
+  }
+  const lines = view.controls.slice(0, limit).map(node => {
+    const name = node.name ? JSON.stringify(node.name.slice(0, 48)) : '""'
+    const focused = node.focused ? '  [focused]' : ''
+    return `  (${node.center.x},${node.center.y})  ${node.path.padEnd(10)}  ${node.type.padEnd(12)} ${name.padEnd(46)} [${node.action}]${focused}${metaNote(node.meta)}`
+  })
+  if (view.controls.length > limit) {
+    lines.push(`  …还有 ${view.controls.length - limit} 个没列出来（把 maxNodes 调大，或先用 window 限定到一个窗口）`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Drive a control addressed by its UIA path instead of by a remembered pixel.
+ * Two wins: the rectangle is measured at the moment of the action (nothing can drift
+ * underneath it), and where a pattern allows it the control is operated directly —
+ * so a filled field needs no keyboard and a button needs no mouse.
+ * @returns {Promise<{handled:boolean, point?:{x:number,y:number}, notes:string[]}|null>}
+ */
+async function uiaStep(step, target) {
+  if (!step.control) return null
+  const path = String(step.control).trim()
+  const handle = target?.handle ?? foregroundWindow()?.handle
+  if (!handle) throw new Error('control 要配一个窗口：前台没有窗口，用 window 指定一个')
+  const read = await uia({ action: 'rect', handle, path }, { timeoutMs: 20000 })
+  if (!read.ok) throw new Error(`窗口里找不到控件 ${path}：${read.error ?? '未知原因'}`)
+  const element = read.element
+  const label = `控件 ${path}${element.name ? `「${element.name}」` : ''}`
+  const patterns = Array.isArray(element.patterns) ? element.patterns : []
+  const point = centerOf(element.rect)
+
+  if (step.action === 'type') {
+    if (patterns.includes('value') && !element.meta?.readonly) {
+      const filled = await uia({ action: 'setvalue', handle, path, value: String(step.text ?? '') }, { timeoutMs: 20000 })
+      if (filled.ok) {
+        return { handled: true, notes: [`直接给${label}喂了 ${String(step.text ?? '').length} 个字符（UIA 赋值，没碰键盘）`] }
+      }
+    }
+    if (!point) throw new Error(`${label} 没有可点的矩形，没法聚焦后打字`)
+    return { handled: false, point, notes: [] }
+  }
+
+  if (step.action === 'click' || step.action === 'double_click') {
+    const how = step.how ?? (patterns.includes('invoke') ? 'invoke' : 'click')
+    if (how === 'invoke') {
+      const pressed = await uia({ action: 'invoke', handle, path }, { timeoutMs: 20000 })
+      if (pressed.ok) {
+        return { handled: true, notes: [`用 UIA 直接按了${label}（没动鼠标，前台是谁都行）`] }
+      }
+    }
+    if (!point) throw new Error(`${label} 没有可点的矩形`)
+    return { handled: false, point, notes: [`${label} 的中心是 (${point.x},${point.y})`] }
+  }
+
+  if (!point) return null
+  return { handled: false, point, notes: [] }
+}
 
 function resolveWindow(ref) {
   if (ref === undefined || ref === null || ref === '') return null
@@ -63,6 +210,7 @@ function observe(config, { settleMs, force = false, note } = {}) {
     forceImage: force,
   })
   state.lastShot = { ...shot, at: Date.now() }
+  state.lastLookAt = Date.now()
   const desk = describeDesktop({ maxWindows: 6 })
   const head = shot.unchanged
     ? `画面和上一张逐像素一样（没重存文件，你手上那张图继续有效）：${shot.path}（${shot.imageWidth}x${shot.imageHeight}）`
@@ -194,21 +342,27 @@ export function createTools(ctx, config) {
   const look = defineTool({
     name: 'screen_look',
     description: [
-      '看主人的 Windows 桌面：截一张图存成 PNG，同时报出前台窗口和可见窗口列表。',
-      '截图本身要用 read_image 打开返回的 path 才能看见内容；本工具负责把「哪块屏幕、什么窗口、坐标怎么换」讲清楚。',
-      '参数 window 可以按标题片段或 handle 只截某个窗口；region 只截一块矩形；不给就是整屏。',
+      '看主人的 Windows 桌面。默认 mode=auto：先去读这个窗口的 UI Automation 控件清单——',
+      '控件够用就只回一张文字清单（每个控件的中心坐标、路径、该怎么操作），**完全不截图**，省下读图的时间和 token；',
+      '控件太少（游戏、自绘界面、Chromium 页面这类不暴露 UIA 的）才乖乖截图。',
+      'mode=pixels 强制截图；mode=uia 强制只看控件清单。',
+      '截图本身要用 read_image 打开返回的 path 才能看见内容。',
       '动手之前先 look 一眼，这是本插件的规矩。',
-      '注意：window 单拍走 PrintWindow，图里比窗口矩形少一圈隐形边框，照它换算最多偏二十几像素——',
-      '要精确点某个控件，用整屏截图算坐标，或者用 screen_uia 报的物理坐标。',
     ].join(''),
     parameters: {
-      window: { type: 'string', description: '窗口标题片段或 handle；只截这个窗口。' },
+      window: { type: 'string', description: '窗口标题片段或 handle；省略就是前台窗口。' },
+      mode: {
+        type: 'string',
+        enum: ['auto', 'uia', 'pixels'],
+        description: 'auto（默认）有 UIA 就走文字清单，没有才截图；uia 只读控件；pixels 只截图。',
+      },
       region: {
         type: 'object',
         additionalProperties: false,
-        description: '只截一块区域，物理像素坐标。',
+        description: '只截一块区域，物理像素坐标（仅 pixels 模式）。',
         properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } },
       },
+      maxNodes: { type: 'number', description: 'UIA 最多读多少个节点（默认 160）。' },
       maxWidth: { type: 'number', description: '图片最大宽度（默认 1600，越小越省 token）。' },
       maxHeight: { type: 'number', description: '图片最大高度（默认 1200）。' },
     },
@@ -217,25 +371,82 @@ export function createTools(ctx, config) {
         type: 'object',
         additionalProperties: false,
         properties: {
-          path: { type: 'string', required: true },
-          imageWidth: { type: 'number', required: true },
-          imageHeight: { type: 'number', required: true },
-          sourceWidth: { type: 'number', required: true },
-          sourceHeight: { type: 'number', required: true },
-          originX: { type: 'number', required: true },
-          originY: { type: 'number', required: true },
-          scaleX: { type: 'number', required: true },
-          scaleY: { type: 'number', required: true },
+          mode: { type: 'string', required: true, description: 'uia 或 pixels：这次走的是哪条路' },
+          path: { type: 'string', description: '截图路径（只有 pixels 模式才有）' },
+          imageWidth: { type: 'number' },
+          imageHeight: { type: 'number' },
+          sourceWidth: { type: 'number' },
+          sourceHeight: { type: 'number' },
+          originX: { type: 'number' },
+          originY: { type: 'number' },
+          scaleX: { type: 'number' },
+          scaleY: { type: 'number' },
+          controls: { type: 'number', description: 'UIA 给出多少个可操作控件' },
           foreground: { type: 'string' },
           summary: { type: 'string', required: true },
         },
       },
-      render: (_args, value) => [{ type: 'text', text: `${value.summary}\n\n用 read_image 打开这张图：${value.path}` }],
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.path ? `${value.summary}\n\n用 read_image 打开这张图：${value.path}` : value.summary,
+      }],
     },
-    timeoutMs: 30000,
+    timeoutMs: 40000,
     isConcurrencySafe: () => true,
     async execute(args) {
       const target = resolveWindow(args.window)
+      const mode = args.mode ?? 'auto'
+      const desk = describeDesktop({ maxWindows: args.window ? 3 : 12 })
+      const handle = target?.handle ?? desk.foreground?.handle
+      const winTitle = target?.title
+        || desk.windows.find(w => w.handle === handle)?.title
+        || listWindows().find(w => w.handle === handle)?.title
+        || (handle ? `handle=${handle}` : '前台窗口')
+      let fallbackReason = ''
+      let seenControls = 0
+
+      if (mode !== 'pixels' && handle) {
+        let view = null
+        try {
+          view = await uiaView({ handle }, { maxNodes: args.maxNodes ?? 160 })
+        } catch (error) {
+          fallbackReason = `UIA 读不了这个窗口：${error.message}`
+        }
+        const count = view?.controls.length ?? 0
+        seenControls = count
+        if (view && count >= (config.uiaMinControls ?? 3)) {
+          // Knowledge is fresh, but there is no image to anchor imageX/imageY against.
+          state.lastLookAt = Date.now()
+          state.lastShot = null
+          const head = `没截图——「${winTitle}」的 UIA 够用：${count} 个可操作控件，照这张清单直接干活`
+          return {
+            mode: 'uia',
+            controls: count,
+            foreground: desk.foreground?.title ?? '',
+            summary: [
+              head,
+              controlLines(view, { title: winTitle }),
+              view.truncated ? '（树被截断了，只列了前一部分）' : '',
+              '坐标是屏幕物理像素，可以直接喂 screen_act 的 x/y；也可以把第二列的 path 当 control 传给 screen_act / screen_sequence，本鱼动手时会重新量它的位置。',
+            ].filter(Boolean).join('\n'),
+          }
+        }
+        if (mode === 'uia') {
+          return {
+            mode: 'uia',
+            controls: count,
+            foreground: desk.foreground?.title ?? '',
+            summary: `「${winTitle}」没有可用的 UIA 控件（${count} 个）。这个程序大概得靠截图——用 screen_look mode=pixels。`,
+          }
+        }
+        fallbackReason = fallbackReason || `UIA 只给出 ${count} 个可操作控件`
+        if (view && count === 0 && view.nodes.length > 1) {
+          // Nodes exist but none is usable: usually they are behind another window, which
+          // is worth saying out loud — the fix is to raise the window, not to squint at a picture.
+          fallbackReason += `（读到 ${view.nodes.length} 个节点，但都被挡住或不可操作——把窗口切前台再看会更准）`
+        }
+      }
+
       const shot = grab({
         dir: config.shotDir,
         window: target?.handle,
@@ -245,9 +456,11 @@ export function createTools(ctx, config) {
         name: 'look',
       })
       state.lastShot = { ...shot, at: Date.now() }
-      const desk = describeDesktop({ maxWindows: args.window ? 3 : 12 })
+      state.lastLookAt = Date.now()
       return {
+        mode: 'pixels',
         path: shot.path,
+        controls: seenControls,
         imageWidth: shot.imageWidth,
         imageHeight: shot.imageHeight,
         sourceWidth: shot.sourceWidth,
@@ -257,7 +470,12 @@ export function createTools(ctx, config) {
         scaleX: shot.scaleX,
         scaleY: shot.scaleY,
         foreground: desk.foreground?.title ?? '',
-        summary: `${shot.label} 已截取（${Math.round(shot.bytes / 1024)} KB）\n${windowLines(desk)}\n${coordHint(shot)}`,
+        summary: [
+          `${shot.label} 已截取（${Math.round(shot.bytes / 1024)} KB）`,
+          fallbackReason ? `为什么走截图：${fallbackReason}` : '',
+          windowLines(desk),
+          coordHint(shot),
+        ].filter(Boolean).join('\n'),
       }
     },
   })
@@ -302,12 +520,13 @@ export function createTools(ctx, config) {
     description: [
       '读一个窗口的 UI 自动化（UIA）控件树，或者按控件操作——比盲点鼠标稳得多，而且不需要窗口在前台。',
       'action=tree 拿控件树（每个节点有 path、类型、名字、坐标、可用模式）；action=find 按名字/类型/id 找控件；',
+      'action=rect 按 path 取单个控件当下的位置和状态（最轻，点它之前用它量一次）；',
       'action=invoke 点按钮、setvalue 填输入框、getvalue 读输入框、select 选中列表项、focus 聚焦。',
       'path 用 tree 返回的路径字符串（如 0/2/1/1），只在这个窗口内有效。',
     ].join(''),
     parameters: {
       window: { type: 'string', description: '窗口标题片段或 handle；省略就是当前前台窗口。' },
-      action: { type: 'string', enum: ['window', 'tree', 'find', 'invoke', 'setvalue', 'getvalue', 'select', 'focus'], required: true },
+      action: { type: 'string', enum: ['window', 'tree', 'rect', 'find', 'invoke', 'setvalue', 'getvalue', 'select', 'focus'], required: true },
       path: { type: 'string', description: 'tree 返回的控件路径，如 0/3/1/1/1。' },
       name: { type: 'string', description: '按控件名字找（find/invoke/setvalue 等）。' },
       automationId: { type: 'string', description: 'find：按 AutomationId 找。' },
@@ -385,6 +604,8 @@ export function createTools(ctx, config) {
       y: { type: 'number', description: '物理屏幕 y 坐标。' },
       imageX: { type: 'number', description: '按上一张截图的像素 x 来定位。' },
       imageY: { type: 'number', description: '按上一张截图的像素 y 来定位。' },
+      control: { type: 'string', description: '按 UIA 控件路径定位（screen_look / screen_uia 给的 path，如 0/2/1）。给了它 x/y 就忽略；动作时会重新量控件的位置，支持 Invoke 的按钮直接用 UIA 按下去，不点鼠标。' },
+      how: { type: 'string', enum: ['click', 'invoke'], description: 'control 怎么驱动：invoke 用 UIA 直接触发（默认，控件支持的话），click 走鼠标点它的中心。' },
       toX: { type: 'number', description: 'drag 终点 x。' },
       toY: { type: 'number', description: 'drag 终点 y。' },
       button: { type: 'string', enum: ['left', 'right', 'middle'], description: '鼠标键，默认 left。' },
@@ -408,12 +629,12 @@ export function createTools(ctx, config) {
 
       const action = args.action
       // "Look before you touch": a stale or missing look means the agent is guessing.
-      if (action !== 'move') {
-        const last = state.lastShot
-        const age = last ? Date.now() - last.at : Infinity
+      // A control path is exempt — it gets re-measured at action time, so it cannot drift.
+      if (action !== 'move' && !args.control) {
+        const age = state.lastLookAt ? Date.now() - state.lastLookAt : Infinity
         if (age > staleAfterMs(config)) {
-          return `⛔ 先看一眼再动手：${last ? `上一张截图已经是 ${Math.round(age / 1000)} 秒前的了` : '还没有截过屏'}。`
-            + '调用 screen_look 重新截一张（看完再动手），然后重试这一步。'
+          return `⛔ 先看一眼再动手：${state.lastLookAt ? `上一次观察已经是 ${Math.round(age / 1000)} 秒前的了` : '还没看过屏幕'}。`
+            + '调用 screen_look（有 UIA 就回控件清单，没有才截图），然后再动手。'
         }
       }
 
@@ -433,7 +654,14 @@ export function createTools(ctx, config) {
         }
       }
 
-      const notes = performAction(action, args, config, { point, target })
+      const driven = await uiaStep(args, target)
+      let notes
+      if (driven?.handled) {
+        notes = [...driven.notes]
+      } else {
+        notes = performAction(action, args, config, { point: driven?.point ?? point, target })
+        if (driven?.notes?.length) notes.unshift(...driven.notes)
+      }
       const fg = foregroundWindow()
       notes.push(`当前前台：${fg ? `${fg.title} handle=${fg.handle}` : '无'}`)
 
@@ -451,6 +679,8 @@ export function createTools(ctx, config) {
       '一次调用跑完一整串动作（切窗口 → 点输入框 → 打字 → 回车 → 看结果），只回一次、只截一张图。',
       '省的不是点击速度，是「你和电脑来回说多少次话」：五步任务从五次往返变成一次。',
       'steps 每一步的字段和 screen_act 一样（action 必填），但不用写 observe。',
+      '每步也可以只给 control（UIA 控件路径）：本鱼会在动作那一刻重新量它的位置——',
+      'type 直接给输入框赋值（不碰键盘）、按钮直接 Invoke（不动鼠标），位置漂了也不怕。',
       '整批会先过安全闸：任何一步含敏感动作（启动程序、关窗口、Alt+F4、Win 组合键），整批一步都不动，除非 confirmed: true。',
       '任何一步失败默认立刻停下（stopOnError: false 可继续），并报出是第几步、为什么。',
       'dryRun: true 只校验并列出计划，不碰桌面。',
@@ -473,6 +703,8 @@ export function createTools(ctx, config) {
             y: { type: 'number', description: '屏幕物理像素 y。' },
             imageX: { type: 'number', description: '按当前截图里的像素 x 定位。' },
             imageY: { type: 'number', description: '按当前截图里的像素 y 定位。' },
+            control: { type: 'string', description: '按 UIA 控件路径定位（如 0/2/1）：动作时重新量位置，type 直接赋值、按钮直接 Invoke。给了它就不用写 x/y。' },
+            how: { type: 'string', enum: ['click', 'invoke'], description: 'control 怎么驱动：invoke 用 UIA 直接触发（默认），click 走鼠标点中心。' },
             toX: { type: 'number', description: 'drag 终点 x。' },
             toY: { type: 'number', description: 'drag 终点 y。' },
             button: { type: 'string', enum: ['left', 'right', 'middle'], description: '鼠标键，默认 left。' },
@@ -522,11 +754,10 @@ export function createTools(ctx, config) {
         return `计划（dryRun：只校验，什么都没动）\n${steps.map((s, i) => `${i + 1}. ${summarizeStep(s)}`).join('\n')}`
       }
 
-      const last = state.lastShot
-      const age = last ? Date.now() - last.at : Infinity
+      const age = state.lastLookAt ? Date.now() - state.lastLookAt : Infinity
       if (age > staleAfterMs(config)) {
-        return `⛔ 先看一眼再动手：${last ? `上一张截图已经是 ${Math.round(age / 1000)} 秒前的了` : '还没有截过屏'}。`
-          + '调用 screen_look 截一张，再发这一批。'
+        return `⛔ 先看一眼再动手：${state.lastLookAt ? `上一次观察已经是 ${Math.round(age / 1000)} 秒前的了` : '还没看过屏幕'}。`
+          + '调用 screen_look 看一眼，再发这一批（每步都带 control 的话可以免这一步）。'
       }
 
       let target = null
@@ -551,8 +782,14 @@ export function createTools(ctx, config) {
             stepTarget = resolveWindow(step.window)
             if (!focusWindow(stepTarget.handle)) throw new Error(`切不到前台「${stepTarget.title || stepTarget.handle}」`)
           }
-          const point = pointOf(step)
-          const notes = performAction(step.action, step, config, { point, target: stepTarget })
+          const driven = await uiaStep(step, stepTarget)
+          let notes
+          if (driven?.handled) {
+            notes = [...driven.notes]
+          } else {
+            notes = performAction(step.action, step, config, { point: driven?.point ?? pointOf(step), target: stepTarget })
+            if (driven?.notes?.length) notes.unshift(...driven.notes)
+          }
           rows.push(`  ${i + 1}. ✓ ${String(Date.now() - t0).padStart(4)}ms  ${step.action} — ${notes.join('；')}`)
         } catch (err) {
           failed = { index: i, message: err.message }

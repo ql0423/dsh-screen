@@ -13,16 +13,17 @@
 
 | 工具 | 能力 |
 | --- | --- |
-| `screen_look` | 截屏（整屏 / 某个窗口 / 一块区域），存成 PNG，同时报告前台窗口和窗口列表，附带图片坐标→屏幕坐标的换算 |
+| `screen_look` | 看一眼。默认 `mode=auto`：**先读 UIA 控件清单，够用就不截图**；不够用才截图（整屏 / 某个窗口 / 一块区域），附带图片坐标→屏幕坐标的换算 |
 | `screen_windows` | 列出所有可见窗口：标题、窗口类、handle、位置大小、是否最小化 |
 | `screen_focus` | 把某个窗口切到前台（最小化的先还原） |
-| `screen_uia` | 读窗口的 UI Automation 控件树，或按控件操作：`invoke` 点按钮、`setvalue` 填输入框、`getvalue` 读值、`select` 选中、`focus` 聚焦 |
-| `screen_act` | 动手：`click` / `double_click` / `right_click` / `move` / `drag` / `scroll` / `type` / `key` / `hotkey` / `open` / `close` |
+| `screen_uia` | 读窗口的 UI Automation 控件树，或按控件操作：`rect` 量单个控件位置、`invoke` 点按钮、`setvalue` 填输入框、`getvalue` 读值、`select` 选中、`focus` 聚焦 |
+| `screen_act` | 动手：`click` / `double_click` / `right_click` / `move` / `drag` / `scroll` / `type` / `key` / `hotkey` / `open` / `close`。可以用 `control` 直接指名某个控件 |
 | `screen_sequence` | **一串动作一次调用跑完**（最多 24 步）：整批先过安全闸、失败即停并报出第几步、收尾只截一张图 |
 
 三件让它比"盲点坐标"好用的设计：
 
-- **UIA 优先**。控件的名字、类型、坐标都能读出来，点按钮不用猜像素；而且 UIA 不要求窗口在前台。
+- **两套眼睛，自动选**。有 UIA 的程序读控件清单（名字、类型、中心坐标、该怎么操作），**一张图都不用拍**；没有 UIA 的程序老老实实截图。判据是可操作控件的数量，不够就退回截图，并把原因写在返回里。
+- **按控件说话，不按像素说话**。`control: "0/2/1"` 指的是那个控件本身——动手那一刻才去量它的位置，所以列表滚动、窗口挪位都骗不到它；输入框有 Value 模式就直接赋值（不碰键盘），按钮有 Invoke 模式就直接触发（不动鼠标、也不管前台是谁）。
 - **打完自动回看**。`screen_act` 执行完默认再截一张图（先等画面重绘），智能体能自己确认这一步有没有生效，不用你盯。
 - **同样的画面不重复存**。截出来的像素和上一张逐像素一样时，直接说"没变"，不写新文件、不占你的注意力。
 
@@ -41,6 +42,35 @@
 | 动作后立刻截图 | 可能拍到重绘前的旧画面 | 先等 180 ms 再拍 | `settleMs`（可配、可关） |
 
 实测（本机 2560×1600，Windows PowerShell 5.1）：`screen_look` 129 ms、整屏截图降采样 100 ms、`screen_sequence` 10 步 1 ms。第一次读 UIA 仍要付一次 ~400 ms 的 worker 启动费，之后一直是几十毫秒；worker 闲置 5 分钟自动退出，不留后台进程。
+
+## 两套眼睛怎么选
+
+`screen_look` 默认 `mode=auto`，顺序是固定的：**先问 UIA，不够才截图**。
+
+```text
+没截图——「记事本」的 UIA 够用：6 个可操作控件，照这张清单直接干活
+  (443,221)  0/2/1       Button       "新建"                        [invoke]
+  (500,300)  0/2/3       Edit         ""                            [fill]  [value:"草稿"]
+  (455,332)  0/2/4       CheckBox     "自动换行"                    [toggle]  [toggle:Off]
+```
+
+- 每个控件给三样东西：**中心坐标**（物理像素，能直接喂 `screen_act` 的 `x/y`）、**路径**（能当 `control:` 用）、**该怎么操作**（`invoke` 点按钮 / `fill` 填字 / `toggle` 开关 / `select` 选中 / `expand` 展开 / `scroll` 滚动）。
+- 顺便带上会改变判断的状态：输入框里已有内容、复选框开没开、是不是密码框、只读没只读。
+- 可操作控件少于 `uiaMinControls`（默认 3）就退回截图，并在返回里**说明为什么**——"UIA 只给出 0 个可操作控件"。
+
+只读不动的路径也快：`screen_uia action=rect` 只量一个控件，不用整棵树。
+
+**诚实的边界**（本机 2026-10-28 实测，2560×1600）：
+
+| 场景 | UIA 读到的可操作控件 | 走哪条路 |
+| --- | --- | --- |
+| 开始菜单（打开时） | 21 个（List / ListItem / Button） | 文字清单，不截图 |
+| 经典 Win32 对话框、WPF、UWP | 通常够用 | 文字清单 |
+| Edge / Electron 页面 | 0–1 个（Chromium 的无障碍要单独开） | 截图 |
+| 自绘界面、游戏 | 0 个 | 截图 |
+| 被别的窗口完全挡住的窗口 | 节点在，全报 offscreen | 截图，并提示"先切前台" |
+
+也就是说：**这不是"UIA 一定更快"，而是"有 UIA 就别浪费截图，没有就别硬等它"**。这台机器上大部分窗口其实属于后者，所以两条路都得留着。
 
 ## 安全闸
 
@@ -71,6 +101,7 @@
     requireFreshLookSeconds: 120  # 动手前多久内必须看过屏幕；0 = 不检查
     settleMs: 180         # 动作后等画面重绘多久再截图；0 = 立刻拍
     maxSequenceSteps: 24  # screen_sequence 一批最多几步
+    uiaMinControls: 3     # screen_look 的 auto 模式里，UIA 至少给出几个可操作控件才不截图
 ```
 
 不想用常驻 UIA worker（比如企业环境不允许长驻进程），设环境变量 `DSH_SCREEN_UIA_WORKER=0`，会退回"每次新起一个 PowerShell"的老路子——功能一样，慢约 400 毫秒。

@@ -1,7 +1,8 @@
-﻿# UI Automation core — dot-source me. Loads UIAutomation + DPI awareness once,
+# UI Automation core — dot-source me. Loads UIAutomation + DPI awareness once,
 # then every request is just Invoke-UiaRequest; no per-call process start.
 $ErrorActionPreference = 'Stop'
 $script:Result = $null
+$script:WithMeta = $false
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -46,9 +47,37 @@ function Get-PatternNames($el) {
   return @($names)
 }
 
+function Get-Meta($el) {
+  # State that changes what an action means: a filled field, a checked box, a slider
+  # position. Read defensively — not every control implements every pattern.
+  $m = [ordered]@{}
+  try {
+    $v = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    if ($v) {
+      $text = [string]$v.Current.Value
+      if ($v.Current.IsReadOnly) { $m.readonly = $true }
+      if (-not $el.Current.IsPassword) { $m.value = $text }
+    }
+  } catch { }
+  try {
+    $t = $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+    if ($t) { $m.toggle = [string]$t.Current.ToggleState -replace '^ToggleState\.', '' }
+  } catch { }
+  try {
+    $e = $el.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($e) { $m.expand = [string]$e.Current.ExpandCollapseState -replace '^ExpandCollapseState\.', '' }
+  } catch { }
+  try {
+    $r = $el.GetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern)
+    if ($r) { $m.value = $r.Current.Value; $m.min = $r.Current.Minimum; $m.max = $r.Current.Maximum }
+  } catch { }
+  try { if ($el.Current.IsPassword) { $m.password = $true } } catch { }
+  return $m
+}
+
 function Describe($el, $path, $depth) {
   $c = $el.Current
-  return [ordered]@{
+  $d = [ordered]@{
     path        = $path
     name        = [string]$c.Name
     type        = [string]$c.ControlType.ProgrammaticName -replace '^ControlType\.', ''
@@ -61,6 +90,11 @@ function Describe($el, $path, $depth) {
     depth       = $depth
     patterns    = [string[]]@(Get-PatternNames $el)
   }
+  if ($script:WithMeta) {
+    $meta = Get-Meta $el
+    if ($meta.Count -gt 0) { $d.meta = $meta }
+  }
+  return $d
 }
 
 function Resolve-Root($req) {
@@ -107,17 +141,37 @@ try {
       $d = Describe $root '0' 0
       Out-Json @{ ok = $true; root = $d }
     }
+    'rect' {
+      # One control by path (or name) with its live rectangle: the hands use this so a
+      # click lands on where the control IS now, not where it was when the screen was read.
+      $el = if ($req.path) { Resolve-Path $root ([string]$req.path) } else { $null }
+      if ($el -eq $null) {
+        if (-not $req.name) { throw 'rect needs path or name' }
+        $cond = New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, [string]$req.name)
+        $el = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+      }
+      if ($el -eq $null) { throw 'element not found' }
+      $script:WithMeta = $true
+      Out-Json @{ ok = $true; element = (Describe $el ([string]$req.path) 0) }
+    }
     'tree' {
       $maxDepth = if ($req.maxDepth) { [int]$req.maxDepth } else { 6 }
       $maxNodes = if ($req.maxNodes) { [int]$req.maxNodes } else { 400 }
       $onlyNamed = [bool]$req.onlyNamed
+      $script:WithMeta = [bool]$req.meta
+      $skipOffscreen = -not [bool]$req.includeOffscreen
       $nodes = New-Object System.Collections.ArrayList
 
       function Walk($el, $path, $depth, $walker) {
         if ($nodes.Count -ge $maxNodes) { return }
         $d = Describe $el $path $depth
-        if (-not $onlyNamed -or $d.name -ne '' -or $d.patterns.Count -gt 0) {
-          [void]$nodes.Add($d)
+        # An offscreen control cannot be clicked, so it does not belong in the list — but
+        # its subtree must still be walked: UWP content lives under a cloaked frame that
+        # reports offscreen while every real control inside is perfectly visible.
+        if (-not ($skipOffscreen -and $d.offscreen -and $depth -gt 0)) {
+          if (-not $onlyNamed -or $d.name -ne '' -or $d.patterns.Count -gt 0) {
+            [void]$nodes.Add($d)
+          }
         }
         if ($depth -ge $maxDepth) { return }
         $child = $walker.GetFirstChild($el)
