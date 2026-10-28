@@ -11,6 +11,7 @@ import { createTools } from './tools.js'
 import { screenMetrics } from './win32.js'
 import { shotDir } from './capture.js'
 import { stopUiaWorker } from './uia.js'
+import { stopOverlay, warmOverlay } from './overlay.js'
 
 export const name = 'dsh-screen'
 
@@ -28,6 +29,9 @@ const DEFAULTS = {
   settleMs: 180,
   maxSequenceSteps: 24,
   uiaMinControls: 3,
+  overlay: true,
+  overlayIdleMs: 1600,
+  cancelOnEsc: false,
 }
 
 export const Config = hasHostRuntime
@@ -42,6 +46,9 @@ export const Config = hasHostRuntime
     settleMs: z.number().default(180).description('动作后等画面重绘多久再截图，默认 180 毫秒'),
     maxSequenceSteps: z.number().default(24).description('screen_sequence 一批最多几步'),
     uiaMinControls: z.number().default(3).description('screen_look 的 auto 模式里，UIA 至少给出几个可操作控件才不截图'),
+    overlay: z.boolean().default(true).description('动手时在屏幕顶部显示「DSH 正在操作你的电脑」状态条'),
+    overlayIdleMs: z.number().default(1600).description('最后一次动作之后，状态条再停留多久才消失'),
+    cancelOnEsc: z.boolean().default(false).description('额外保险：按 Esc 中断正在跑的动作/批次（默认关，敏感操作本身已有确认）'),
   })
   : undefined
 
@@ -64,6 +71,16 @@ export function apply(ctx, config) {
     ctx.logger?.warn?.(`[dsh-screen] Win32 unavailable, tools will report the failure: ${error?.message ?? error}`)
   }
 
+  if (resolved.overlay !== false) {
+    // Warm the status pill now: it needs a second to start PowerShell and compile its form,
+    // and a status line that shows up two seconds after the click is not a status line.
+    try {
+      warmOverlay()
+    } catch (error) {
+      ctx.logger?.warn?.(`[dsh-screen] overlay unavailable, actions still work: ${error?.message ?? error}`)
+    }
+  }
+
   for (const tool of createTools(ctx, resolved)) {
     // One colliding name must cost that one tool, never the rest of the set.
     try {
@@ -81,6 +98,7 @@ export function apply(ctx, config) {
     disposers.length = 0
     // Leave no stray PowerShell behind when the plugin goes away.
     try { stopUiaWorker() } catch { /* nothing warm to stop */ }
+    try { stopOverlay() } catch { /* the pill was never shown */ }
   }
   try { ctx.on('dispose', cleanup) } catch { /* older host without a dispose event */ }
   return cleanup

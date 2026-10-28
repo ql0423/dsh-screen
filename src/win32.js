@@ -34,6 +34,7 @@ const SendInput = f(user32, 'uint32 __stdcall SendInput(uint32 cInputs, void *pI
 const MapVirtualKeyW = f(user32, 'uint32 __stdcall MapVirtualKeyW(uint32 uCode, uint32 uMapType)')
 const VkKeyScanW = f(user32, 'int16 __stdcall VkKeyScanW(uint16 ch)')
 const GetKeyState = f(user32, 'int16 __stdcall GetKeyState(int nVirtKey)')
+const GetAsyncKeyState = f(user32, 'int16 __stdcall GetAsyncKeyState(int vKey)')
 const keybd_event = f(user32, 'void __stdcall keybd_event(uint8 bVk, uint8 bScan, uint32 dwFlags, uint64 dwExtraInfo)')
 
 const CreateCompatibleDC = f(gdi32, 'void * __stdcall CreateCompatibleDC(void *hdc)')
@@ -304,6 +305,19 @@ export function resolveKey(name) {
   if (/^[a-z0-9]$/.test(key)) return key.toUpperCase().charCodeAt(0)
   if (/^vk_?[0-9a-f]{1,2}$/.test(key)) return parseInt(key.replace(/^vk_?/, ''), 16)
   throw new Error(`unknown key: ${name}`)
+}
+
+/**
+ * Is this key physically down right now? Async key state is global: it works even when
+ * none of our windows has focus — exactly the case when the user reaches for Esc.
+ * Returns false instead of throwing, because a status check must never break an action.
+ */
+export function isKeyDown(name) {
+  try {
+    return (GetAsyncKeyState(resolveKey(name)) & 0x8000) !== 0
+  } catch {
+    return false
+  }
 }
 
 function pressModifiers(modifiers, down) {

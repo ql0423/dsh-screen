@@ -4,20 +4,43 @@ import { defineTool } from './runtime.js'
 import {
   listWindows, foregroundWindow, focusWindow, windowHandleByTitle, closeWindow,
   click, drag, scroll, tryMoveCursor, cursorPosition, typeText, pressKey, hotkey,
-  processNameOfPid, screenMetrics,
+  processNameOfPid, screenMetrics, isKeyDown,
 } from './win32.js'
 import { grab, describeDesktop, settle } from './capture.js'
 import { uia } from './uia.js'
 import { gate } from './safety.js'
+import { pulseOverlay } from './overlay.js'
 
 const text = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
+
+/**
+ * Tell the user, on their own screen, that the machine is being driven.
+ * Without this they are looking at some other window and cannot tell a working agent
+ * from one that has already finished (or hung).
+ */
+function showDriving(config, detail) {
+  if (config.overlay === false) return
+  const hint = config.cancelOnEsc ? '　·　按 Esc 取消' : ''
+  pulseOverlay(`●  DSH 正在操作你的电脑${detail ? `　${detail}` : ''}${hint}`, config.overlayIdleMs ?? 1600)
+}
+
+/**
+ * Esc as a brake, opt-in. Read from async key state so it works while the agent is busy
+ * in another window. A synthetic Esc we sent ourselves must not trip it, so the caller
+ * passes the time of its own last Esc.
+ */
+function escPressed(config, ignoreUntil = 0) {
+  if (!config.cancelOnEsc) return false
+  if (Date.now() < ignoreUntil) return false
+  return isKeyDown('esc')
+}
 
 /**
  * Only one screenshot is "current" at a time; actions may reference its pixel space.
  * `lastLookAt` is about freshness of *knowledge*: a UI Automation read counts as a look
  * even though it produced no image at all.
  */
-const state = { lastShot: null, lastLookAt: 0 }
+const state = { lastShot: null, lastLookAt: 0, ignoreEscUntil: 0 }
 
 /** Control types that can be operated even when they advertise no UIA pattern. */
 const OPERABLE_TYPES = new Set([
@@ -654,6 +677,12 @@ export function createTools(ctx, config) {
         }
       }
 
+      // Light up the "I am driving" pill, and honour the brake before anything is sent.
+      if (escPressed(config, state.ignoreEscUntil)) {
+        return '⛔ 主人按了 Esc，这一下没发出去（Esc 取消是配置里开着的）。'
+      }
+      showDriving(config)
+
       const driven = await uiaStep(args, target)
       let notes
       if (driven?.handled) {
@@ -664,6 +693,10 @@ export function createTools(ctx, config) {
       }
       const fg = foregroundWindow()
       notes.push(`当前前台：${fg ? `${fg.title} handle=${fg.handle}` : '无'}`)
+      // Our own Esc must not look like the user's brake on the next step.
+      if (action === 'key' && String(args.key ?? '').toLowerCase() === 'esc') {
+        state.ignoreEscUntil = Date.now() + 600
+      }
 
       // A move changes nothing anyone can see, so it does not pay for a frame by default.
       const wantsObserve = args.observe ?? (action !== 'move')
@@ -776,6 +809,13 @@ export function createTools(ctx, config) {
       for (let i = 0; i < steps.length; i++) {
         const step = { ...steps[i] }
         const t0 = Date.now()
+        // The brake works between steps, which is where a batch can still be stopped cleanly.
+        if (escPressed(config, state.ignoreEscUntil)) {
+          failed = { index: i, message: '主人按了 Esc，取消了' }
+          rows.push(`  ${i + 1}. ⛔         step — 主人按了 Esc，剩下 ${steps.length - i} 步一步没发`)
+          break
+        }
+        showDriving(config, `第 ${i + 1}/${steps.length} 步`)
         try {
           let stepTarget = target
           if (step.window) {
@@ -795,6 +835,9 @@ export function createTools(ctx, config) {
           failed = { index: i, message: err.message }
           rows.push(`  ${i + 1}. ✗ ${String(Date.now() - t0).padStart(4)}ms  ${step.action} — ${err.message}`)
           if (args.stopOnError !== false) break
+        }
+        if (step.action === 'key' && String(step.key ?? '').toLowerCase() === 'esc') {
+          state.ignoreEscUntil = Date.now() + 600
         }
       }
 
