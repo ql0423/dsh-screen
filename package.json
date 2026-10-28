@@ -1,0 +1,56 @@
+{
+  "name": "dsh-screen",
+  "version": "0.2.2",
+  "description": "Desktop eyes and hands for DeepSeek Harness: screenshot, window control, UI Automation tree and SendInput mouse/keyboard, all driven from inside DSH — no floating ball, no extra window",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "NOTES.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "computer-use",
+    "windows",
+    "uiautomation",
+    "screen"
+  ],
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": { "optional": true },
+    "@deepseek-ai/schemastery": { "optional": true }
+  },
+  "dependencies": {
+    "koffi": "^3.3.4"
+  },
+  "license": "MIT",
+  "author": "ql0423",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ql0423/dsh-screen.git"
+  },
+  "homepage": "https://github.com/ql0423/dsh-screen#readme",
+  "bugs": {
+    "url": "https://github.com/ql0423/dsh-screen/issues"
+  }
+}

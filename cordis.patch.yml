@@ -1,0 +1,17 @@
+# Inserts dsh-screen enabled, with the safety gate on: the agent can look at the
+# screen and drive the mouse/keyboard, but opening programs, closing windows and
+# system hotkeys need the partner's explicit go-ahead (confirmed: true).
+# Override the row by id in a profile to change readOnly / allowRisky / shotDir.
+- insert:
+    - id: dsh-screen
+      name: dsh-screen
+#
+# Developing on this repository? A package name always resolves to the same path,
+# so the loader keeps the first copy of the module in memory and edited code stays
+# stale until DSH restarts. To hot-reload instead, point the entry at the file and
+# bump the cache-buster:
+#
+#   name: file:///E:/path/to/dsh-screen/src/index.js?v=3
+#
+# Remember to put the package name back before publishing — a file:// address is
+# bound to one machine.
