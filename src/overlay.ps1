@@ -1,5 +1,5 @@
 # dsh-screen overlay helper.
-# A tiny always-on-top pill that says "DSH is driving this computer".
+# An always-on-top pill that says "DSH is driving this computer".
 # Protocol (one command per line on stdin):
 #   show <base64 utf8 text>
 #   hide
@@ -14,6 +14,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Concurrent;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -43,13 +44,15 @@ public static class DshIn {
 }
 
 public class DshBanner : Form {
+  const int Radius = 20;
   public DshBanner() {
     FormBorderStyle = FormBorderStyle.None;
     TopMost = true;
     ShowInTaskbar = false;
     StartPosition = FormStartPosition.Manual;
-    BackColor = Color.FromArgb(18, 24, 40);
-    Opacity = 0.93;
+    BackColor = Color.FromArgb(10, 16, 30);
+    Opacity = 0.96;
+    DoubleBuffered = true;
   }
   protected override bool ShowWithoutActivation { get { return true; } }
   protected override CreateParams CreateParams {
@@ -61,6 +64,32 @@ public class DshBanner : Form {
       return cp;
     }
   }
+  public static GraphicsPath Rounded(Rectangle r, int radius) {
+    GraphicsPath path = new GraphicsPath();
+    int d = radius * 2;
+    path.AddArc(r.X, r.Y, d, d, 180, 90);
+    path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+    path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+    path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+    path.CloseFigure();
+    return path;
+  }
+  public void Shape() {
+    using (GraphicsPath path = Rounded(new Rectangle(0, 0, Width, Height), Radius)) {
+      Region old = Region;
+      Region = new Region(path);
+      if (old != null) old.Dispose();
+    }
+  }
+  protected override void OnPaint(PaintEventArgs e) {
+    base.OnPaint(e);
+    e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+    using (GraphicsPath path = Rounded(new Rectangle(1, 1, Width - 3, Height - 3), Radius)) {
+      using (Pen pen = new Pen(Color.FromArgb(110, 150, 255), 2f)) {
+        e.Graphics.DrawPath(pen, path);
+      }
+    }
+  }
 }
 '@ -ReferencedAssemblies System.Windows.Forms, System.Drawing
 
@@ -70,9 +99,9 @@ $form = New-Object DshBanner
 $label = New-Object System.Windows.Forms.Label
 $label.AutoSize = $true
 $label.ForeColor = [System.Drawing.Color]::White
-$label.BackColor = [System.Drawing.Color]::FromArgb(18, 24, 40)
-$label.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11, [System.Drawing.FontStyle]::Bold)
-$label.Padding = New-Object System.Windows.Forms.Padding(22, 11, 22, 11)
+$label.BackColor = [System.Drawing.Color]::FromArgb(10, 16, 30)
+$label.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 16, [System.Drawing.FontStyle]::Bold)
+$label.Padding = New-Object System.Windows.Forms.Padding(38, 20, 38, 20)
 $label.Text = ' '
 $form.Controls.Add($label)
 
@@ -80,12 +109,14 @@ $script:ShowBanner = {
   param([string]$text)
   $label.Text = $text
   $form.ClientSize = New-Object System.Drawing.Size($label.Width, $label.Height)
+  $form.Shape()
   $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
   $form.Location = New-Object System.Drawing.Point(
     [int]($bounds.X + ($bounds.Width - $form.Width) / 2),
-    [int]($bounds.Y + 12))
+    [int]($bounds.Y + 16))
   if (-not $form.Visible) { $form.Show() }
   $form.TopMost = $true
+  $form.Invalidate()
 }
 
 [DshIn]::Start()
