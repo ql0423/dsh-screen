@@ -130,3 +130,17 @@
 ## 隐私
 
 不联网、不截图上传、不记录操作内容。图片只写进本机 `shotDir`（默认 `%TEMP%\dsh-screen\shots`），用户随时可删。
+## 宣传片 v2 的流水线（2026-10-29）
+
+`promo-v2/` 里是一整套可重跑的工具：`script.md`（分镜与口播）、`gen_voice.py`（edge-tts 配音 + ffprobe 量时长）、`make_cards.py`（Pillow 渲染 1920×1080 卡面与字幕条）、`build_video.py`（逐场编码 → 拼接 → 混背景音乐）。
+
+**这台机器的 ffmpeg 是残废版**（`D:\ACLOS\Cross\recorder-release\ffmpeg.exe`）：
+- 没有 `libx264`，但有 `h264_nvenc`（GPU 编码，反而快）；
+- **没有 PNG 编解码器**，`-i card.png` 直接报 `Decoder (codec png) not found`，`-c:v png` 报 `Default encoder ... disabled`；
+- 但 **BMP 和 MJPEG 都在**——卡面先用 Pillow 存成 `.bmp`（无损），抽帧用 `-c:v mjpeg` 出 `.jpg`。
+
+**字幕不烧 drawtext，改成叠 PNG**：每句话渲染成一张 1920×210 的透明字幕条，卡面合成时贴上去，实拍片段用 `overlay` 叠上去。绕开了 drawtext 对中文、逗号、冒号的转义雷区。
+
+**发布片里不能出现真实账号名**：UIA 清单里第一版直接印着主人的账号和 QQ 邮箱，发现后改成「（账号名已隐去）」。凡是把工具输出搬上镜头的，先审一遍隐私。
+
+配音参数：`zh-CN-YunjianNeural`（云健，Passion）、`rate=+8%`。改声线只动 `gen_voice.py` 顶部三个常量，整条片子会自动重排时长（时长全从 `audio/timing.json` 来，没有一处手写秒数）。
