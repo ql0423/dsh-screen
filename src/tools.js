@@ -5,11 +5,12 @@ import {
   listWindows, foregroundWindow, focusWindow, windowHandleByTitle, closeWindow,
   click, drag, scroll, tryMoveCursor, cursorPosition, typeText, pressKey, hotkey,
   processNameOfPid, screenMetrics, isKeyDown, shellOpen, splitAppSpec,
+  isWindowAlive, readClipboardText, writeClipboardText, clipboardSequence,
 } from './win32.js'
 import { grab, describeDesktop, settle } from './capture.js'
-import { uia } from './uia.js'
+import { uia, uiaWorkerStatus } from './uia.js'
 import { gate } from './safety.js'
-import { pulseOverlay } from './overlay.js'
+import { pulseOverlay, overlayStatus } from './overlay.js'
 
 const text = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
 
@@ -295,8 +296,13 @@ function performAction(action, args, config, { point, target }) {
     }
     case 'hotkey': {
       if (!args.keys) throw new Error('hotkey 需要 keys')
+      // Ctrl+C only queues the copy; the owner renders it on the first request, so a
+      // read straight afterwards still sees the old clipboard. Wait for the counter.
+      const copyLike = /ctrl|control/.test(String(args.keys)) && /(^|\+)c$/i.test(String(args.keys).replace(/\s+/g, ''))
+      const before = copyLike ? clipboardSequence() : -1
       hotkey(args.keys)
-      notes.push(`按了组合键 ${args.keys}`)
+      const copied = copyLike ? waitClipboardChange(before, 900) : false
+      notes.push(`按了组合键 ${args.keys}${copyLike ? (copied ? '（剪贴板已刷新）' : '（剪贴板没变化，可能没有可复制的内容）') : ''}`)
       break
     }
     case 'open': {
@@ -305,16 +311,33 @@ function performAction(action, args, config, { point, target }) {
       // as a shell command (which silently fails and still reports a pid).
       const spec = splitAppSpec(args.app)
       if (!spec) throw new Error('open 需要 app')
+      const before = windowHandlesNow()
+      const startedAt = Date.now()
       const launched = shellOpen(spec.file, spec.params)
-      notes.push(launched.ok
-        ? `打开了 ${spec.file}${spec.params ? ` ${spec.params}` : ''}（由系统默认程序处理）`
-        : `打开失败：${spec.file}（ShellExecute 返回 ${launched.code}${launched.error ? `，${launched.error}` : ''}）`)
+      if (!launched.ok) {
+        notes.push(`打开失败：${spec.file}（ShellExecute 返回 ${launched.code}${launched.error ? `，${launched.error}` : ''}）`)
+        break
+      }
+      // 受不受理 ≠ 有没有开。等到窗口出现才算数。
+      const exeHint = (spec.file.split(/[\\/]/).pop() || '').replace(/\.exe$/i, '')
+      const appeared = waitForNewWindow(before, { timeoutMs: 5000, processHint: exeHint })
+      const waited = Date.now() - startedAt
+      notes.push(appeared
+        ? `打开了 ${spec.file}${spec.params ? ` ${spec.params}` : ''}（确认到新窗口：「${appeared.title}」handle=${appeared.handle}，等了 ${waited}ms）`
+        : `ShellExecute 受理了 ${spec.file}，但 ${(waited / 1000).toFixed(1)} 秒内没等到新窗口——可能它本来就在运行、开在了后台、或者根本没起来。别当成功，用 screen_windows 核一下。`)
       break
     }
     case 'close': {
       if (!target) throw new Error('close 需要 window')
       const ok = closeWindow(target.handle)
-      notes.push(`${ok ? '已请求关闭' : '关闭请求失败'}：${target.title || target.handle}`)
+      if (!ok) {
+        notes.push(`关闭请求被系统拒绝：${target.title || target.handle}`)
+        break
+      }
+      const gone = waitForWindowGone(target.handle)
+      notes.push(gone
+        ? `已关闭并确认窗口消失：${target.title || target.handle}`
+        : `已发出关闭请求，但窗口还在（多半弹了「是否保存」之类的对话框）：${target.title || target.handle}。截一张图看看它在等什么。`)
       break
     }
     default:
@@ -334,9 +357,67 @@ function pointOf(args) {
   return null
 }
 
-/** How stale the last look may be before the hands are refused, in ms. */
+/**
+ * How stale the last look may be before the hands are refused, in ms.
+ *
+ * `requireFreshLookSeconds <= 0` (or a nonsense value) means "do not check": the point
+ * of the knob is to be able to turn the check off, and 0 previously meant the opposite
+ * (every action refused, because any age is greater than zero).
+ */
 function staleAfterMs(config) {
-  return (config.requireFreshLookSeconds ?? 120) * 1000
+  const seconds = Number(config.requireFreshLookSeconds)
+  if (!Number.isFinite(seconds) || seconds <= 0) return Infinity
+  return seconds * 1000
+}
+
+/** Wait until the clipboard counter moves (a copy has been rendered), or give up. */
+function waitClipboardChange(before, timeoutMs = 900) {
+  if (before < 0) return false
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (clipboardSequence() !== before) return true
+    settle(50)
+  }
+  return clipboardSequence() !== before
+}
+
+/** Snapshot of the top-level handles right now, so a launch can be confirmed by difference. */
+function windowHandlesNow() {
+  const handles = new Set()
+  for (const w of listWindows()) handles.add(w.handle)
+  return handles
+}
+
+/**
+ * Wait until a window that was not there before appears.
+ *
+ * ShellExecute's return code only says the shell accepted the request — it does not say
+ * anything opened. This is the difference between "I called open" and "a window exists".
+ * @returns {object|null} the window that appeared, or null
+ */
+function waitForNewWindow(before, { timeoutMs = 5000, processHint = '' } = {}) {
+  const hint = String(processHint || '').toLowerCase()
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const fresh = listWindows().filter(w => !before.has(w.handle) && w.title && w.title.trim())
+    if (fresh.length) {
+      if (!hint) return fresh[0]
+      const named = fresh.find(w => String(processNameOfPid(w.pid) || '').toLowerCase().includes(hint))
+      return named ?? fresh[0]
+    }
+    settle(180)
+  }
+  return null
+}
+
+/** Wait until a window handle stops being a live window. */
+function waitForWindowGone(handle, { timeoutMs = 2500 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!isWindowAlive(handle)) return true
+    settle(150)
+  }
+  return !isWindowAlive(handle)
 }
 
 /** One human-readable line for a planned step. */
@@ -420,7 +501,9 @@ export function createTools(ctx, config) {
       }],
     },
     timeoutMs: 40000,
-    isConcurrencySafe: () => true,
+    // Not concurrency-safe: it rewrites state.lastShot / lastLookAt, and a look racing
+    // with an act could replace a fresh observation with a null screenshot.
+    isConcurrencySafe: () => false,
     async execute(args) {
       const target = resolveWindow(args.window)
       const mode = args.mode ?? 'auto'
@@ -549,12 +632,13 @@ export function createTools(ctx, config) {
       '读一个窗口的 UI 自动化（UIA）控件树，或者按控件操作——比盲点鼠标稳得多，而且不需要窗口在前台。',
       'action=tree 拿控件树（每个节点有 path、类型、名字、坐标、可用模式）；action=find 按名字/类型/id 找控件；',
       'action=rect 按 path 取单个控件当下的位置和状态（最轻，点它之前用它量一次）；',
-      'action=invoke 点按钮、setvalue 填输入框、getvalue 读输入框、select 选中列表项、focus 聚焦。',
+      'action=invoke 点按钮、setvalue 填输入框、getvalue 读输入框、select 选中列表项、focus 聚焦；',
+      'action=text 把窗口/文档/输入框里的**文字读出来**——比截图认字准得多，也省 token。',
       'path 用 tree 返回的路径字符串（如 0/2/1/1），只在这个窗口内有效。',
     ].join(''),
     parameters: {
       window: { type: 'string', description: '窗口标题片段或 handle；省略就是当前前台窗口。' },
-      action: { type: 'string', enum: ['window', 'tree', 'rect', 'find', 'invoke', 'setvalue', 'getvalue', 'select', 'focus'], required: true },
+      action: { type: 'string', enum: ['window', 'tree', 'rect', 'find', 'invoke', 'setvalue', 'getvalue', 'select', 'focus', 'text'], required: true },
       path: { type: 'string', description: 'tree 返回的控件路径，如 0/3/1/1/1。' },
       name: { type: 'string', description: '按控件名字找（find/invoke/setvalue 等）。' },
       automationId: { type: 'string', description: 'find：按 AutomationId 找。' },
@@ -564,6 +648,7 @@ export function createTools(ctx, config) {
       maxDepth: { type: 'number', description: 'tree 最大深度，默认 6。' },
       maxNodes: { type: 'number', description: 'tree 最大节点数，默认 400。' },
       onlyNamed: { type: 'boolean', description: 'tree 只返回有名字或有可用模式的节点（推荐 true，省 token）。' },
+      maxLength: { type: 'number', description: 'text 最多读多少字符，默认 20000。' },
     },
     output: text,
     timeoutMs: 60000,
@@ -582,6 +667,7 @@ export function createTools(ctx, config) {
         ...(args.maxDepth !== undefined ? { maxDepth: args.maxDepth } : {}),
         ...(args.maxNodes !== undefined ? { maxNodes: args.maxNodes } : {}),
         ...(args.onlyNamed !== undefined ? { onlyNamed: args.onlyNamed } : {}),
+        ...(args.maxLength !== undefined ? { maxLength: args.maxLength } : {}),
       }
       const result = await uia(request, { timeoutMs: 55000 })
       if (!result.ok) throw new Error(`UIA ${args.action} 失败：${result.error}`)
@@ -606,6 +692,12 @@ export function createTools(ctx, config) {
       if (args.action === 'window') {
         const r = result.root
         return `窗口：${JSON.stringify(r.name)} 类型=${r.type} 位置=${r.rect ? `${r.rect.width}x${r.rect.height}@${r.rect.x},${r.rect.y}` : '未知'} 可用模式=${(r.patterns ?? []).join(',') || '无'}`
+      }
+      if (args.action === 'text') {
+        const body = String(result.text ?? '')
+        const where = args.path ? `控件 ${args.path}` : args.name ? `「${args.name}」` : '窗口'
+        const head = `${where} 读到 ${body.length} 个字符（${result.via ?? 'UIA'}${result.truncated ? '，已按 maxLength 截断' : ''}）`
+        return body ? `${head}\n\n${body}` : `${head}\n\n（这里是空的，没有文字可读）`
       }
       return `UIA ${args.action} 完成${result.value !== undefined ? `，当前值：${JSON.stringify(result.value)}` : ''}${result.invoked ? `，控件：${JSON.stringify(result.invoked.name ?? '')}` : ''}`
     },
@@ -852,7 +944,8 @@ export function createTools(ctx, config) {
         ? `批次停在第 ${failed.index + 1} 步：共 ${steps.length} 步，完成 ${okCount} 步，整批 ${elapsed}ms`
         : `批次完成：${steps.length} 步全过，整批 ${elapsed}ms（一次调用，一次截图）`
 
-      if (args.capture === 'none') return `${header}\n${rows.join('\n')}`
+      // capture:'none' 在成功时省一张图，但失败时必须给证据——参数说明里就是这么写的。
+      if (args.capture === 'none' && !failed) return `${header}\n${rows.join('\n')}`
       const observed = observe(config, {
         settleMs: args.settleMs,
         note: failed ? `停下的原因：${failed.message}` : undefined,
@@ -861,5 +954,157 @@ export function createTools(ctx, config) {
     },
   })
 
-  return [look, windows, focus, uiaTool, act, sequence]
+  const status = defineTool({
+    name: 'screen_status',
+    description: [
+      '一眼看清插件现在的状态：权限（只读/敏感动作免确认/Esc 刹车）、观察时效还剩多久、',
+      'UIA 常驻 worker 热不热、截图存在哪、屏幕尺寸、状态条是否活着。',
+      '动手前想知道「我现在是什么权限、上一次看屏幕还新不新鲜」就用它——比截一张图便宜得多。',
+    ].join(''),
+    parameters: {},
+    output: text,
+    timeoutMs: 15000,
+    isConcurrencySafe: () => true,
+    async execute() {
+      const metrics = screenMetrics()
+      const fg = foregroundWindow()
+      const age = state.lastLookAt ? Date.now() - state.lastLookAt : null
+      const limit = staleAfterMs(config)
+      const worker = uiaWorkerStatus()
+      const pill = overlayStatus()
+      const freshness = limit === Infinity
+        ? '不检查（requireFreshLookSeconds <= 0）'
+        : age === null
+          ? `还没看过屏幕；动手前必须 screen_look（限时 ${Math.round(limit / 1000)} 秒）`
+          : age > limit
+            ? `已过期：上一次观察在 ${(age / 1000).toFixed(0)} 秒前，超过 ${Math.round(limit / 1000)} 秒，动手会被拦`
+            : `有效：上一次观察在 ${(age / 1000).toFixed(1)} 秒前，还剩 ${((limit - age) / 1000).toFixed(0)} 秒`
+      const cooling = worker.coolingUntil > Date.now()
+        ? `，冷却中再 ${Math.round((worker.coolingUntil - Date.now()) / 1000)} 秒`
+        : ''
+      return [
+        `屏幕：${metrics.width}x${metrics.height} @ (${metrics.x},${metrics.y})，${metrics.monitors} 个显示器`,
+        `前台：${fg ? `${fg.title || '(无标题)'} handle=${fg.handle}` : '无'}`,
+        `观察时效：${freshness}`,
+        `权限：只读=${config.readOnly ? '开' : '关'}｜敏感动作免确认=${config.allowRisky ? '开' : '关'}｜Esc 刹车=${config.cancelOnEsc ? '开' : '关'}`,
+        `批量：最多 ${config.maxSequenceSteps} 步；动作后等 ${config.settleMs} ms 再截图`,
+        `UIA worker：${worker.warm ? '热（约 40ms 一次）' : worker.starting ? '正在启动' : '冷（下次约 400ms）'}${cooling}`,
+        `状态条：${pill.running ? '在跑' : '没起'}${pill.error ? `（最近报错：${pill.error.slice(0, 80)}）` : ''}`,
+        `截图目录：${config.shotDir}`,
+        `上一张截图：${state.lastShot?.path ?? '（没有；或上一次是无图的 UIA 观察）'}`,
+      ].join('\n')
+    },
+  })
+
+  const waitTool = defineTool({
+    name: 'screen_wait',
+    description: [
+      '等一件事真的发生，而不是睡固定毫秒。',
+      'kind=window 等标题含某段字的窗口出现（foreground:true 还要求它到前台）；',
+      'kind=control 等某个窗口里出现某个名字的控件；kind=text 等某个窗口里的文字包含某段字。',
+      '默认最多等 10 秒、每 250ms 看一次；等到了立刻返回，超时会说清最后看到了什么。',
+    ].join(''),
+    parameters: {
+      kind: { type: 'string', enum: ['window', 'control', 'text'], required: true },
+      window: { type: 'string', description: 'kind=window：标题片段；kind=control/text：限定在哪个窗口（省略=前台）。' },
+      name: { type: 'string', description: 'kind=control：控件的名字（UIA Name 精确匹配）。' },
+      text: { type: 'string', description: 'kind=text：要找的那段文字。' },
+      foreground: { type: 'boolean', description: 'kind=window：还要求那个窗口已经在前台。' },
+      timeoutMs: { type: 'number', description: '最多等多久，默认 10000。' },
+      intervalMs: { type: 'number', description: '多久看一次，默认 250。' },
+    },
+    output: text,
+    timeoutMs: 60000,
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const kind = args.kind
+      if (!['window', 'control', 'text'].includes(kind)) throw new Error('kind 只能是 window / control / text')
+      const timeout = Math.min(Math.max(Number(args.timeoutMs) || 10000, 250), 55000)
+      const interval = Math.min(Math.max(Number(args.intervalMs) || 250, 60), 2000)
+      const started = Date.now()
+      const deadline = started + timeout
+      let lastSeen = '还没看到什么'
+
+      const targetWindow = () => {
+        if (args.window) return resolveWindow(args.window)
+        const fg = foregroundWindow()
+        return fg ? { handle: fg.handle, title: fg.title } : null
+      }
+
+      while (Date.now() < deadline) {
+        if (kind === 'window') {
+          if (!args.window) throw new Error('kind=window 需要 window（标题片段）')
+          const match = windowHandleByTitle(args.window)
+          if (match && (!args.foreground || foregroundWindow()?.handle === match.handle)) {
+            return `等到了（${Date.now() - started}ms）：窗口「${match.title}」handle=${match.handle}${args.foreground ? '，已经在前台' : ''}`
+          }
+          lastSeen = match ? `窗口在，但还没到前台（当前前台是「${foregroundWindow()?.title ?? '无'}」）` : `没有标题含「${args.window}」的窗口`
+        } else {
+          const target = targetWindow()
+          if (!target?.handle) {
+            lastSeen = '没有可读的窗口'
+          } else if (kind === 'control') {
+            if (!args.name) throw new Error('kind=control 需要 name')
+            try {
+              const found = await uia({ action: 'find', handle: target.handle, name: args.name }, { timeoutMs: 8000 })
+              if (found.ok && Number(found.count) > 0) {
+                const first = found.matches?.[0]
+                return `等到了（${Date.now() - started}ms）：窗口「${target.title}」里出现了控件「${args.name}」${first?.rect ? `，位置 ${first.rect.width}x${first.rect.height}@${first.rect.x},${first.rect.y}` : ''}`
+              }
+              lastSeen = `窗口「${target.title}」里还没有叫「${args.name}」的控件`
+            } catch (error) {
+              lastSeen = `读控件失败：${error.message}`
+            }
+          } else {
+            if (!args.text) throw new Error('kind=text 需要 text')
+            try {
+              const read = await uia({ action: 'text', handle: target.handle, maxLength: 20000 }, { timeoutMs: 8000 })
+              const body = String(read.text ?? '')
+              if (read.ok && body.includes(args.text)) {
+                return `等到了（${Date.now() - started}ms）：窗口「${target.title}」的文字里出现了「${args.text}」（共 ${body.length} 个字符）`
+              }
+              lastSeen = read.ok ? `读到了 ${body.length} 个字符，但里面还没有「${args.text}」` : `读不了这个窗口的文字：${read.error}`
+            } catch (error) {
+              lastSeen = `读文字失败：${error.message}`
+            }
+          }
+        }
+        settle(Math.min(interval, Math.max(60, deadline - Date.now())))
+      }
+      return `⛔ 等了 ${timeout}ms 没等到。最后看到的：${lastSeen}\n`
+        + '（要么它确实没发生，要么等的东西不在这个窗口里——可以 screen_look 看一眼现在的画面。）'
+    },
+  })
+
+  const clipboard = defineTool({
+    name: 'screen_clipboard',
+    description: [
+      '读写剪贴板。get：把剪贴板里的文字读回来——比截图认字准，也省 token；',
+      'set：把文字放进剪贴板，再配合 screen_act 的 hotkey "ctrl+v" 粘进任何输入框。',
+      '长文本走这条路比逐字注入快得多，也不会被输入法搅乱。',
+    ].join(''),
+    parameters: {
+      action: { type: 'string', enum: ['get', 'set'], required: true },
+      text: { type: 'string', description: 'action=set 时要写进剪贴板的文字。' },
+    },
+    output: text,
+    timeoutMs: 20000,
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      if (args.action === 'get') {
+        const value = readClipboardText()
+        if (!value) return '剪贴板里没有文字（可能只放了图片或文件）。'
+        const limit = 8000
+        const body = value.length > limit
+          ? `${value.slice(0, limit)}…（还有 ${value.length - limit} 个字符没显示）`
+          : value
+        return `剪贴板里 ${value.length} 个字符：\n\n${body}`
+      }
+      if (typeof args.text !== 'string') throw new Error('action=set 需要 text')
+      const written = writeClipboardText(args.text)
+      return `已把 ${written} 个字符放进剪贴板。要粘进输入框，就在 screen_act 里按 hotkey "ctrl+v"。`
+    },
+  })
+
+  return [look, windows, focus, uiaTool, act, sequence, status, waitTool, clipboard]
 }

@@ -262,6 +262,61 @@ try {
       $el.SetFocus()
       Out-Json @{ ok = $true }
     }
+    'text' {
+      # Read what is actually written in a document/edit/console instead of making the
+      # model look at a picture of it. TextPattern first; ValuePattern as the fallback,
+      # because plenty of controls expose one and not the other.
+      $limit = if ($req.maxLength) { [int]$req.maxLength } else { 20000 }
+      $el = if ($req.path) { Resolve-Path $root ([string]$req.path) } else { $null }
+      if ($el -eq $null) {
+        if ($req.name) {
+          $cond = New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, [string]$req.name)
+          $el = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        } else {
+          $el = $root
+        }
+      }
+      if ($el -eq $null) { throw 'element not found' }
+
+      # A window root rarely exposes text; the content lives on a Document/Edit child.
+      # Try the requested element, then the first Document and the first Edit under it.
+      $targets = New-Object System.Collections.ArrayList
+      [void]$targets.Add(@{ el = $el; label = 'element' })
+      foreach ($typeName in @('Document', 'Edit')) {
+        try {
+          $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::$typeName)
+          $found = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+          if ($found -ne $null) { [void]$targets.Add(@{ el = $found; label = $typeName }) }
+        } catch { }
+      }
+
+      $text = $null
+      $via = $null
+      $usedLabel = $null
+      foreach ($candidate in $targets) {
+        if ($text -ne $null) { break }
+        try {
+          $p = $candidate.el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+          $text = $p.DocumentRange.GetText($limit)
+          $via = 'TextPattern'
+          $usedLabel = $candidate.label
+        } catch {
+          try {
+            $v = $candidate.el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+            $text = $v.Current.Value
+            $via = 'ValuePattern'
+            $usedLabel = $candidate.label
+          } catch { }
+        }
+      }
+      if ($text -eq $null) {
+        throw 'this element exposes neither TextPattern nor ValuePattern; read the window with screen_look instead'
+      }
+      if ($text -eq $null) { $text = '' }
+      $truncated = $false
+      if ($text.Length -gt $limit) { $text = $text.Substring(0, $limit); $truncated = $true }
+      Out-Json @{ ok = $true; text = $text; length = $text.Length; via = $via; source = $usedLabel; truncated = $truncated }
+    }
     default { throw "unknown action: $action" }
   }
 } catch {

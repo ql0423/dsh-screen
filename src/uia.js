@@ -37,6 +37,7 @@ const IDLE_MS = 5 * 60 * 1000
 let worker = null
 let spawnFailures = 0
 let workerCooldownUntil = 0
+let lastRequestAt = 0
 
 /** Tear the warm worker down; safe to call at any time. */
 export function stopUiaWorker() {
@@ -48,6 +49,17 @@ export function stopUiaWorker() {
   const timer = setTimeout(() => { try { w.child.kill() } catch { /* already gone */ } }, 300)
   timer.unref?.()
   try { w.child.unref() } catch { /* nothing to detach */ }
+}
+
+/** Is the warm worker up, and is it being avoided after repeated start failures? */
+export function uiaWorkerStatus() {
+  return {
+    warm: Boolean(worker && worker.ready && !worker.dead),
+    starting: Boolean(worker && !worker.ready && !worker.dead),
+    failures: spawnFailures,
+    coolingUntil: workerCooldownUntil,
+    lastRequestAgoMs: lastRequestAt ? Date.now() - lastRequestAt : null,
+  }
 }
 
 function ensureWorker() {
@@ -176,6 +188,7 @@ function viaOneShot(payloadB64, timeoutMs) {
 export async function uia(request, { timeoutMs = 30000 } = {}) {
   const payloadB64 = Buffer.from(JSON.stringify(request), 'utf8').toString('base64')
   const warm = process.env.DSH_SCREEN_UIA_WORKER !== '0' && Date.now() > workerCooldownUntil
+  lastRequestAt = Date.now()
 
   if (warm) {
     try {
@@ -201,4 +214,4 @@ export async function uia(request, { timeoutMs = 30000 } = {}) {
   return viaOneShot(payloadB64, timeoutMs)
 }
 
-export const uiaActions = ['window', 'tree', 'find', 'invoke', 'setvalue', 'getvalue', 'select', 'focus']
+export const uiaActions = ['window', 'tree', 'rect', 'find', 'invoke', 'setvalue', 'getvalue', 'select', 'focus', 'text']

@@ -18,9 +18,12 @@
 | `screen_look` | 看一眼。默认 `mode=auto`：**先读 UIA 控件清单，够用就不截图**；不够用才截图（整屏 / 某个窗口 / 一块区域），附带图片坐标→屏幕坐标的换算 |
 | `screen_windows` | 列出所有可见窗口：标题、窗口类、handle、位置大小、是否最小化 |
 | `screen_focus` | 把某个窗口切到前台（最小化的先还原） |
-| `screen_uia` | 读窗口的 UI Automation 控件树，或按控件操作：`rect` 量单个控件位置、`invoke` 点按钮、`setvalue` 填输入框、`getvalue` 读值、`select` 选中、`focus` 聚焦 |
+| `screen_uia` | 读窗口的 UI Automation 控件树，或按控件操作：`rect` 量单个控件位置、`invoke` 点按钮、`setvalue` 填输入框、`getvalue` 读值、`select` 选中、`focus` 聚焦、**`text` 把正文读出来** |
 | `screen_act` | 动手：`click` / `double_click` / `right_click` / `move` / `drag` / `scroll` / `type` / `key` / `hotkey` / `open` / `close`。可以用 `control` 直接指名某个控件 |
 | `screen_sequence` | **一串动作一次调用跑完**（最多 24 步）：整批先过安全闸、失败即停并报出第几步、收尾只截一张图 |
+| `screen_wait` | 等一件事真的发生：窗口出现（可要求到前台）、控件出现、窗口文字包含某段字。等到了立刻返回，超时说清最后看到什么 |
+| `screen_clipboard` | 读写剪贴板：`get` 把选中文字读回来（比截图认字准且省 token），`set` 配合 `ctrl+v` 把长文本粘进去 |
+| `screen_status` | 一眼看清当前权限（只读/免确认/Esc 刹车）、观察有效期还剩多久、UIA worker 热不热、状态条是否活着 |
 
 三件让它比"盲点坐标"好用的设计：
 
@@ -29,7 +32,9 @@
 - **打完自动回看**。`screen_act` 执行完默认再截一张图（先等画面重绘），智能体能自己确认这一步有没有生效，不用你盯。
 - **同样的画面不重复存**。截出来的像素和上一张逐像素一样时，直接说"没变"，不写新文件、不占你的注意力。
 
-手工输入走的是 `KEYEVENTF_UNICODE`，中文直接进去，不依赖输入法；不是模拟键盘敲字那种会被输入法吃掉的方式。
+**成功要有证据，不能看返回值**：`open` 会等到真有一个新窗口出现才说"打开了"（只在 5 秒内没等到就明说"不确定"）；`close` 会等到窗口真的消失才说"已关闭"；按 `ctrl+c` 会等剪贴板序号变化，免得读到上一次的旧内容。
+
+手工输入走的是 `KEYEVENTF_UNICODE`，中文直接进去，不依赖输入法；不是模拟键盘敲字那种会被输入法吃掉的方式。`\n` 和 `\t` 例外——它们被按下真正的回车和 Tab，所以多行文本真的会分成多行。
 
 ## 快在哪
 
@@ -150,6 +155,18 @@ pnpm add file:<这个目录>       # 在 profiles/web 里
 ```
 
 装完重启 DSH Desktop。日志里看到 `[dsh-screen] ready: 2560x1600, 1 monitor(s)` 就是起来了。
+
+## 测试
+
+两条，都能在本机直接跑（不需要装任何测试框架）：
+
+```bash
+node test/unit.mjs       # 22 条：安全闸/危险热键/参数切分，纯逻辑，不碰桌面
+node test/preflight.mjs  # 工具 schema 体检（宿主那套严格 JSON schema 子集）
+node test/smoke.mjs      # 11 条真机 E2E：开记事本 → 打字 → 读回 → 关闭 → 收尾截图
+```
+
+`smoke.mjs` 会真的开一个记事本、打两行字、用 UIA 把字读回来核对、再关掉；它按 **handle** 定位窗口而不是按标题（同时开着两个记事本时，按标题会认错人）。
 
 ## 要求与边界
 

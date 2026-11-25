@@ -2,6 +2,7 @@
 // Everything is in PHYSICAL pixels; the host process sets no DPI virtualization for us.
 import koffi from 'koffi'
 import { existsSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 
 const user32 = koffi.load('user32.dll')
 const gdi32 = koffi.load('gdi32.dll')
@@ -57,6 +58,8 @@ const OpenProcess = f(kernel32, 'void * __stdcall OpenProcess(uint32 dwDesiredAc
 const QueryFullProcessImageNameW = f(kernel32, 'int __stdcall QueryFullProcessImageNameW(void *hProcess, uint32 dwFlags, void *lpExeName, void *lpdwSize)')
 const CloseHandle = f(kernel32, 'int __stdcall CloseHandle(void *hObject)')
 const ShellExecuteW = f(shell32, 'intptr __stdcall ShellExecuteW(void *hwnd, str16 lpOperation, str16 lpFile, str16 lpParameters, str16 lpDirectory, int nShowCmd)')
+const IsWindow = f(user32, 'int __stdcall IsWindow(void *hWnd)')
+const GetClipboardSequenceNumber = f(user32, 'uint32 __stdcall GetClipboardSequenceNumber()')
 
 // SendInput(INPUT) layout on x64: 4 type + 4 pad + 32 union = 40 bytes.
 const INPUT_SIZE = process.arch === 'x64' ? 40 : 28
@@ -362,16 +365,37 @@ export function hotkey(keys) {
   for (let i = vks.length - 1; i >= 0; i--) keyEvent(vks[i], scans[i], KEYEVENTF.KEYUP)
 }
 
-/** Type arbitrary text (including CJK) via KEYEVENTF_UNICODE — no IME needed. */
+/** Type arbitrary text (including CJK) via KEYEVENTF_UNICODE — no IME needed.
+ *
+ * Newline and tab are the exception: sending them as Unicode code points does nothing
+ * in most apps (U+000A is not a Return key). They are pressed as real keys instead, so
+ * "第一行\n第二行" arrives as two lines rather than 第一行第二行.
+ */
 export function typeText(text, { perCharDelayMs = 0 } = {}) {
   ensureDpi()
   const value = String(text)
+  const pause = () => {
+    if (perCharDelayMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, perCharDelayMs)
+  }
+  const press = (vk) => {
+    const scan = MapVirtualKeyW(vk, 0)
+    keyEvent(vk, scan, 0)
+    keyEvent(vk, scan, KEYEVENTF.KEYUP)
+  }
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i)
-    // Surrogate pairs are sent as their own UTF-16 units, which is what Windows expects.
-    keyEvent(0, code, KEYEVENTF.UNICODE)
-    keyEvent(0, code, KEYEVENTF.UNICODE | KEYEVENTF.KEYUP)
-    if (perCharDelayMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, perCharDelayMs)
+    if (code === 0x0d || code === 0x0a) {
+      // A CRLF pair is one Enter, not two.
+      if (code === 0x0d && value.charCodeAt(i + 1) === 0x0a) i++
+      press(VK.enter)
+    } else if (code === 0x09) {
+      press(VK.tab)
+    } else {
+      // Surrogate pairs are sent as their own UTF-16 units, which is what Windows expects.
+      keyEvent(0, code, KEYEVENTF.UNICODE)
+      keyEvent(0, code, KEYEVENTF.UNICODE | KEYEVENTF.KEYUP)
+    }
+    pause()
   }
 }
 
@@ -660,6 +684,67 @@ export function splitAppSpec(spec) {
     return { file: head, params: rest || null }
   }
   return { file: raw, params: null }
+}
+
+/**
+ * Clipboard change counter. A copy is not instant: the owning app renders the data on
+ * first request, so reading immediately after Ctrl+C returns the PREVIOUS contents.
+ * Watching this number is how we know the copy has actually landed.
+ */
+export function clipboardSequence() {
+  try {
+    return Number(GetClipboardSequenceNumber())
+  } catch {
+    return -1
+  }
+}
+
+/** Is this handle still a live window? Used to confirm a close actually happened. */
+export function isWindowAlive(hwndRaw) {
+  try {
+    return Boolean(IsWindow(hwndRaw))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Clipboard text, both ways, through PowerShell's own cmdlets.
+ *
+ * Why not koffi: reading another process's clipboard memory through GlobalLock + decode
+ * is where this bit us — a str16 decode ran past the allocation and killed the process,
+ * and a bounded uint16 decode returned junk. The long way round is 200-400 ms, which for
+ * a clipboard operation is fine, and it is exactly correct: base64 in, raw bytes out, no
+ * string splitting in between.
+ */
+function runPowerShell(command, timeoutMs = 8000) {
+  const result = spawnSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command', command,
+  ], { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 64 * 1024 * 1024 })
+  if (result.error) throw new Error(`剪贴板操作失败：${result.error.message}`)
+  if (result.status !== 0) {
+    const stderr = String(result.stderr ?? '').trim()
+    throw new Error(`剪贴板操作失败（exit ${result.status}）${stderr ? `：${stderr.slice(0, 200)}` : ''}`)
+  }
+  return result.stdout ?? ''
+}
+
+/** Read the clipboard as text. Empty string when it holds no text at all. */
+export function readClipboardText() {
+  const text = runPowerShell('[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::Out.Write((Get-Clipboard -Raw))')
+  return text ?? ''
+}
+
+/**
+ * Put text on the clipboard. Long text goes in this way instead of being typed one
+ * character at a time: one paste is faster and cannot be mangled by an IME.
+ * @returns {number} characters written
+ */
+export function writeClipboardText(text) {
+  const value = String(text ?? '')
+  const encoded = Buffer.from(value, 'utf8').toString('base64')
+  runPowerShell(`$t=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')); Set-Clipboard -Value $t`)
+  return value.length
 }
 
 export const constants = { MOUSEEVENTF, KEYEVENTF, VK, SM, INPUT_SIZE }

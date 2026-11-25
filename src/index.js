@@ -42,7 +42,7 @@ export const Config = hasHostRuntime
     observeMaxWidth: z.number().default(1280).description('动作后自动截图的最大宽度'),
     observeMaxHeight: z.number().default(900).description('动作后自动截图的最大高度'),
     typeDelayMs: z.number().default(0).description('逐字输入时每个字符之间的间隔毫秒数'),
-    requireFreshLookSeconds: z.number().default(120).description('动手前多久内必须看过屏幕，0 = 不检查'),
+    requireFreshLookSeconds: z.number().default(120).description('动手前多久内必须看过屏幕；0 或负数 = 关掉这项检查'),
     settleMs: z.number().default(180).description('动作后等画面重绘多久再截图，默认 180 毫秒'),
     maxSequenceSteps: z.number().default(24).description('screen_sequence 一批最多几步'),
     uiaMinControls: z.number().default(3).description('screen_look 的 auto 模式里，UIA 至少给出几个可操作控件才不截图'),
