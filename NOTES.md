@@ -169,3 +169,15 @@
 ### 一个反例，别忘了
 
 改 `requireFreshLookSeconds` 的时候发现，**配置说明和实际行为能撒谎整整一个版本**：写着「0 = 不检查」，代码里 `age > 0` 恒真，等于永远拒绝。凡是文档里写「0 = 关掉」的旋钮，都得有测试盯着。
+
+## 本地跑测试要先接 koffi（2026-11-26）
+
+仓库里没有 `node_modules`，测试脚本直接 `import koffi` 会找不到。这不是依赖问题，是开发机怎么接的问题：
+
+```powershell
+$gen = "C:\Users\QL0423\AppData\Roaming\dsh-desktop\harness\profiles\.generations\live\dsh-screen+<版本>+<哈希>\node_modules"
+New-Item -ItemType Junction -Path "node_modules\koffi" -Target "$gen\koffi"
+New-Item -ItemType Junction -Path "node_modules\@koromix" -Target "$gen\@koromix"
+```
+
+两个都要接：`koffi` 是 JS 入口，原生的 `.node` 在 `@koromix` 里，少接一个就报 `Cannot find the native Koffi module`。generation 目录会被插件管理器回收，链接失效就按上面重指一次——`node_modules/` 在 `.gitignore` 里，不要提交。
